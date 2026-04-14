@@ -9,7 +9,7 @@ import numpy as np
 import can
 import serial
 
-from bdx_api.config import load_policy_config, STANDUP_GAINS
+from bdx_api.config import load_policy_config, STANDUP_GAINS, POLICY_GAINS_FALLBACK
 from bdx_api.interface import RobotBackend
 from pathlib import Path
 from scipy.spatial.transform import Rotation
@@ -214,9 +214,15 @@ JOINT_LIMITS = {
     "Head_Roll":       (-0.52, 0.52),
 }
 
-CAN_CHANNELS =["can2", "can0", "can1"]
+CAN_CHANNELS =["can2", "can1", "can0"]
 LPF_ALPHA_POS = 1.0  # Pass raw positions (No delay)
-LPF_ALPHA_VEL = 0.1  # Filter velocities (Smooths out the noise)
+LPF_ALPHA_VEL = 1.0  # Filter velocities (Smooths out the noise)
+
+# Safety: enter damping mode if robot tilts more than this many degrees from upright
+FALL_ANGLE_DEG = 45.0
+FALL_THRESHOLD = math.cos(math.radians(FALL_ANGLE_DEG))  # 0.707
+# Safety: enter damping mode if any policy joint target exceeds this (rad)
+MAX_TARGET_RAD = 1.0
 
 
 # ==========================================
@@ -230,6 +236,18 @@ class HardwareBackend(RobotBackend):
         self.use_imu = use_imu # Store it
 
         self.cfg = load_policy_config(model_path)
+
+        # Detect degenerate gains (Kp=1.0, Kd=0.0) and fall back to known-good values
+        stiffness_degenerate = all(abs(k - 1.0) < 1e-6 for k in self.cfg.joint_stiffness)
+        damping_degenerate   = all(abs(k) < 1e-6     for k in self.cfg.joint_damping)
+        if stiffness_degenerate and damping_degenerate:
+            print("[WARNING] ONNX model has degenerate gains (Kp=1.0, Kd=0.0). Using POLICY_GAINS_FALLBACK.")
+            self._policy_kp = [POLICY_GAINS_FALLBACK[n][0] for n in self.cfg.joint_names]
+            self._policy_kd = [POLICY_GAINS_FALLBACK[n][1] for n in self.cfg.joint_names]
+        else:
+            self._policy_kp = list(self.cfg.joint_stiffness)
+            self._policy_kd = list(self.cfg.joint_damping)
+
         self.loop_dt = loop_dt
         self._running = True
         self._last_time = time.time()
@@ -249,12 +267,10 @@ class HardwareBackend(RobotBackend):
         self.num_policy_joints = len(self.policy_joints)
         self.all_joint_names = list(self.policy_joints)
 
-        # If --legs is flagged, add the head joints so the backend powers them
+        # If --legs is flagged, hold Neck_Pitch stiff (Head_Pitch/Yaw/Roll removed)
         if self.legs_only:
-            head_joints =["Neck_Pitch", "Head_Pitch", "Head_Yaw", "Head_Roll"]
-            for hj in head_joints:
-                if hj not in self.all_joint_names:
-                    self.all_joint_names.append(hj)
+            if "Neck_Pitch" not in self.all_joint_names:
+                self.all_joint_names.append("Neck_Pitch")
 
         self.num_joints = len(self.all_joint_names)
 
@@ -321,6 +337,7 @@ class HardwareBackend(RobotBackend):
         self._initialized_filter = True
 
         self._standup_duration = standup_duration
+        self._in_damping_mode = False
         print("\nHardware backend ready.")
 
     def _shutdown_buses(self):
@@ -397,7 +414,49 @@ class HardwareBackend(RobotBackend):
                 self._filtered_positions[i] = raw_pos
                 self._filtered_velocities[i] = raw_vel
 
+    def _enter_damping_mode(self, reason: str):
+        """Latch into damping mode (kp=0, kd=1). Prints once and stays latched."""
+        if not self._in_damping_mode:
+            print(f"\n[SAFETY TRIGGERED] {reason}")
+            print("[SAFETY] Entering damping mode — kp=0, kd=1 on all motors. Restart required.")
+            self._in_damping_mode = True
+
     def _send_targets(self, targets: np.ndarray, use_standup_gains: bool = False):
+        # ---- Safety checks (policy mode only, not during standup/hold) ----
+        if not use_standup_gains and not self._in_damping_mode:
+            # Check 1: fall detection via projected gravity
+            pg = self.get_projected_gravity()
+            gz = float(pg[2])  # upright = -1.0; fallen > 45° means gz > -0.707
+            if gz > -FALL_THRESHOLD:
+                self._enter_damping_mode(
+                    f"Robot has fallen! projected_gravity_z={gz:.3f} (threshold={-FALL_THRESHOLD:.3f})"
+                )
+
+            # Check 2: unreasonable target position
+            if not self._in_damping_mode:
+                for i in range(self.num_policy_joints):
+                    t = float(targets[i])
+                    if abs(t) > MAX_TARGET_RAD:
+                        name = self.all_joint_names[i].strip()
+                        self._enter_damping_mode(
+                            f"Target for {name} = {t:.3f} rad exceeds ±{MAX_TARGET_RAD} rad"
+                        )
+                        break
+
+        # ---- Damping mode: kp=0, kd=1 at current encoder position ----
+        if self._in_damping_mode and not use_standup_gains:
+            for i, (bus_idx, motor_id, motor_type) in enumerate(self._joint_wiring):
+                params = MOTOR_TYPE_PARAMS[motor_type]
+                current_pos = self._motor_states[motor_id]["pos"]
+                _send_mit_command(
+                    self.buses[bus_idx], motor_id,
+                    pos_rad=current_pos, vel_rad_s=0.0,
+                    kp=0.0, kd=1.0, torque_nm=0.0,
+                    params=params,
+                )
+            return
+
+        # ---- Normal operation ----
         for i, (bus_idx, motor_id, motor_type) in enumerate(self._joint_wiring):
             name = self.all_joint_names[i].strip()
             params = MOTOR_TYPE_PARAMS[motor_type]
@@ -411,8 +470,8 @@ class HardwareBackend(RobotBackend):
                 else:
                     kp, kd = 20.0, 1.0  # Safe fallback
             else:
-                kp = self.cfg.joint_stiffness[i]
-                kd = self.cfg.joint_damping[i]
+                kp = self._policy_kp[i]
+                kd = self._policy_kd[i]
 
             pos = float(targets[i])
             if name in JOINT_LIMITS:
@@ -507,6 +566,9 @@ class HardwareBackend(RobotBackend):
     def get_default_pos_array(self, num_actuators: int) -> np.ndarray:
         # Even if the policy only asks for 10 joints, return the full 14 array size so the runner pads it for us
         return np.zeros(self.num_joints, dtype=np.float32)
+
+    def shutdown(self) -> None:
+        self._shutdown_buses()
 
     def get_actual_frequency(self) -> float: return self._actual_cmd_freq
     def get_latency_stats(self):

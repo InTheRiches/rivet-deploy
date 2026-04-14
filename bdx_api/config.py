@@ -21,7 +21,7 @@ def resolve_model_path() -> Path:
         return p
 
     project_root = Path(__file__).resolve().parent.parent
-    default_path = project_root / "models" / "best.onnx"
+    default_path = project_root / "models" / "uni2.onnx"
 
     if not default_path.exists():
         raise FileNotFoundError(
@@ -159,10 +159,10 @@ STANDUP_GAINS = {
     "Right_Hip_Pitch": (78.957, 5.027),
     "Right_Knee":      (78.957, 5.027),
     "Right_Ankle":     (16.581, 1.056),
-    "Neck_Pitch":      (16.581, 1.056),
-    "Head_Pitch":      (2.763,  0.176),
-    "Head_Yaw":        (2.763,  0.176),
-    "Head_Roll":       (2.763,  0.176),
+    "Neck_Pitch":      (50, 3),
+    "Head_Pitch":      (5,  5),
+    "Head_Yaw":        (5,  5),
+    "Head_Roll":       (5,  5),
 }
 
 # ==========================================
@@ -180,10 +180,10 @@ POLICY_GAINS_FALLBACK = {
     "Right_Hip_Pitch": (78.957, 5.027),
     "Right_Knee":      (78.957, 5.027),
     "Right_Ankle":     (16.581, 1.056),
-    "Neck_Pitch":      (16.581, 1.056),
-    "Head_Pitch":      (2.763,  0.176),
-    "Head_Yaw":        (2.763,  0.176),
-    "Head_Roll":       (2.763,  0.176),
+    "Neck_Pitch":      (50, 3),
+    "Head_Pitch":      (10,  3),
+    "Head_Yaw":        (10,  3),
+    "Head_Roll":       (10,  3),
 }
 
 # ==========================================

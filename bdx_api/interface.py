@@ -126,6 +126,7 @@ class RobotBackend(ABC):
     def hold_standing_tick(self) -> None: ...
     @abstractmethod
     def activate_policy_gains(self) -> None: ...
+    def shutdown(self) -> None: pass  # Override in hardware backend to disable motors
 
 # ==========================================
 # Policy Inference Adapters
@@ -190,6 +191,7 @@ class PolicyRunner:
         self.current_interpolated_actions = np.zeros(len(self.cfg.joint_names), dtype=np.float32)
         
         self.dof_targets = self.default_pos.copy()
+        self._filtered_targets = self.default_pos.copy()
 
         self.kb = KeyboardController()
         self.logger = RuntimeLogger(joint_names=self.cfg.joint_names)
@@ -202,8 +204,9 @@ class PolicyRunner:
         if self._sigint_count >= 2:
             print("\n\n  Double Ctrl+C — force quitting!")
             self._cleanup()
+            self.backend.shutdown()
             os._exit(1)
-        print("\n\n  Ctrl+C received — stopping and plotting...")
+        print("\n\n  Ctrl+C received — stopping...")
         self._interrupted = True
 
     def _cleanup(self):
@@ -217,7 +220,18 @@ class PolicyRunner:
         print("\n" + "=" * 50)
         print("  READY TO STAND")
         print("=" * 50)
-        input(">>> Press ENTER to stand up (safe standing gains)...")
+        try:
+            input(">>> Press ENTER to stand up (safe standing gains)...")
+        except (KeyboardInterrupt, EOFError):
+            self._interrupted = True
+
+        if self._interrupted:
+            self._cleanup()
+            self.backend.shutdown()
+            signal.signal(signal.SIGINT, old_handler)
+            print("\nShutdown complete.")
+            return
+
         self.backend.standup(duration=2.0)
 
         print("\nRobot is standing with safe gains. Place it on the floor.")
@@ -230,8 +244,15 @@ class PolicyRunner:
         waiter = threading.Thread(target=_wait_for_enter, daemon=True)
         waiter.start()
 
-        while not enter_pressed.is_set() and self.backend.is_running():
+        while not enter_pressed.is_set() and self.backend.is_running() and not self._interrupted:
             self.backend.hold_standing_tick()
+
+        if self._interrupted:
+            self._cleanup()
+            self.backend.shutdown()
+            signal.signal(signal.SIGINT, old_handler)
+            print("\nShutdown complete.")
+            return
 
         self.backend.activate_policy_gains()
         
@@ -313,7 +334,8 @@ class PolicyRunner:
             #self.dof_targets[self.joint_map] = self.default_pos[self.joint_map].copy()
             # =================================================================
 
-            self.backend.set_joint_targets(self.dof_targets)
+            self._filtered_targets = 0.1 * self._filtered_targets + 0.9 * self.dof_targets
+            self.backend.set_joint_targets(self._filtered_targets)
             self.backend.step()
             ctrl_ticks += 1
             

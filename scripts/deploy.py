@@ -11,7 +11,7 @@ def main():
     parser = argparse.ArgumentParser(description="BDX-R Deploy — sim or real")
     parser.add_argument("--backend", type=str, default="sim", choices=["sim", "real"],
                         help="Backend: 'sim' for MuJoCo, 'real' for hardware")
-    parser.add_argument("--model", type=str, default="models/best.onnx",
+    parser.add_argument("--model", type=str, default="models/uni2.onnx",
                         help="Path to ONNX policy model")
     
     # --- XML PATHS ---
@@ -20,10 +20,10 @@ def main():
     parser.add_argument("--xml_headless", type=str, default="xml/bdxr_legs.xml",
                         help="Path to headless MuJoCo XML (used if --legs is set)") 
     
-    parser.add_argument("--sim_dt", type=float, default=0.005,
+    parser.add_argument("--sim_dt", type=float, default=0.02,
                         help="Simulation timestep (sim only)")
-    parser.add_argument("--decimation", type=int, default=4,
-                        help="Control decimation (policy runs every N steps)")
+    parser.add_argument("--decimation", type=int, default=None,
+                        help="Control decimation (policy runs every N steps). Defaults to round(0.02/sim_dt) to target 50 Hz policy.")
     
     # --- LEGS ONLY FLAG ---
     parser.add_argument("--legs", action="store_true", 
@@ -34,6 +34,8 @@ def main():
                         help="Disable IMU and use constant 0 for gyro and [0,0,-1] for gravity (debugging)")
     
     args = parser.parse_args()
+    if args.decimation is None:
+        args.decimation = max(1, round(0.02 / args.sim_dt))  # target 50 Hz policy
     model_path = Path(args.model)
 
     # ==========================================
@@ -103,8 +105,7 @@ def main():
     # 4. Run the control loop
     runner.run()
 
-
-# ==========================================
+    # ==========================================
     # CSV EXPORT (Flight Recorder)
     # ==========================================
     entries = runner.logger.entries
