@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 USB_CARD = 2  # C-Media USB PnP Sound Device
-VOLUME = 80   # percent (0-100), adjust to taste
+VOLUME = 30   # percent (0-100), adjust to taste
 
 ASSETS = Path(__file__).parent.parent / "assets"
 
@@ -18,10 +18,13 @@ def set_volume(pct):
     subprocess.run(["amixer", "-c", str(USB_CARD), "sset", "PCM Playback Switch", "on"], capture_output=True)
 
 
+MAX_PLAY_SECONDS = 5  # clip each file to this many seconds for the test
+
+
 def play(wav_path):
     result = subprocess.run(
-        ["aplay", "-D", f"plughw:{USB_CARD},0", "-q", str(wav_path)],
-        timeout=10,
+        ["aplay", "-D", f"plughw:{USB_CARD},0", "-q", "-d", str(MAX_PLAY_SECONDS), str(wav_path)],
+        timeout=MAX_PLAY_SECONDS + 5,
         capture_output=True,
     )
     if result.returncode != 0:

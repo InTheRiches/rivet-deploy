@@ -4,6 +4,7 @@ import time
 import signal
 import atexit
 import threading
+import subprocess
 import numpy as np
 import onnxruntime as ort
 from abc import ABC, abstractmethod
@@ -25,6 +26,14 @@ def quat_rotate_inverse(q, v):
     c = q_vec * (np.dot(q_vec, v) * 2.0)
     return a - b + c
 
+_HEAD_STEP = 0.1
+_HEAD_LIMITS = {
+    "Neck_Pitch": (-0.35, 0.87),
+    "Head_Pitch": (-0.87, 0.87),
+    "Head_Yaw":   (-1.05, 1.05),
+    "Head_Roll":  (-0.87, 0.87),
+}
+
 class KeyboardController:
     def __init__(self, lin_vel_step=0.1, ang_vel_step=0.1,
                  lin_vel_x_range=(-1.0, 1.0),
@@ -38,7 +47,9 @@ class KeyboardController:
         self.lin_vel_x_range = lin_vel_x_range
         self.lin_vel_y_range = lin_vel_y_range
         self.ang_vel_z_range = ang_vel_z_range
+        self.head_offsets = {k: 0.0 for k in _HEAD_LIMITS}
         self._quit = False
+        self._sound_request = None
         self._lock = threading.Lock()
         self._old_term_settings = None
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -78,6 +89,7 @@ class KeyboardController:
 
     def _handle_key(self, ch):
         with self._lock:
+            # --- Body locomotion ---
             if ch == 'w': self.lin_vel_x = min(self.lin_vel_x + self.lin_vel_step, self.lin_vel_x_range[1])
             elif ch == 's': self.lin_vel_x = max(self.lin_vel_x - self.lin_vel_step, self.lin_vel_x_range[0])
             elif ch == 'a': self.lin_vel_y = min(self.lin_vel_y + self.lin_vel_step, self.lin_vel_y_range[1])
@@ -86,6 +98,28 @@ class KeyboardController:
             elif ch == 'e': self.ang_vel_yaw = max(self.ang_vel_yaw - self.ang_vel_step, self.ang_vel_z_range[0])
             elif ch == ' ':
                 self.lin_vel_x = 0.0; self.lin_vel_y = 0.0; self.ang_vel_yaw = 0.0
+            # --- Head controls ---
+            elif ch == 'i':
+                lo, hi = _HEAD_LIMITS["Neck_Pitch"]
+                self.head_offsets["Neck_Pitch"] = min(self.head_offsets["Neck_Pitch"] + _HEAD_STEP, hi)
+            elif ch == 'k':
+                lo, hi = _HEAD_LIMITS["Neck_Pitch"]
+                self.head_offsets["Neck_Pitch"] = max(self.head_offsets["Neck_Pitch"] - _HEAD_STEP, lo)
+            elif ch == 'l':
+                lo, hi = _HEAD_LIMITS["Head_Pitch"]
+                self.head_offsets["Head_Pitch"] = min(self.head_offsets["Head_Pitch"] + _HEAD_STEP, hi)
+            elif ch == 'j':
+                lo, hi = _HEAD_LIMITS["Head_Pitch"]
+                self.head_offsets["Head_Pitch"] = max(self.head_offsets["Head_Pitch"] - _HEAD_STEP, lo)
+            elif ch == '[':
+                lo, hi = _HEAD_LIMITS["Head_Yaw"]
+                self.head_offsets["Head_Yaw"] = min(self.head_offsets["Head_Yaw"] + _HEAD_STEP, hi)
+            elif ch == ']':
+                lo, hi = _HEAD_LIMITS["Head_Yaw"]
+                self.head_offsets["Head_Yaw"] = max(self.head_offsets["Head_Yaw"] - _HEAD_STEP, lo)
+            # --- Sound controls ---
+            elif ch in '0123456789':
+                self._sound_request = int(ch)
 
     def restore_terminal(self):
         if self._old_term_settings is not None:
@@ -96,6 +130,16 @@ class KeyboardController:
 
     @property
     def should_quit(self): return self._quit
+
+    def get_head_offsets(self):
+        with self._lock:
+            return dict(self.head_offsets)
+
+    def get_sound_request(self):
+        with self._lock:
+            req = self._sound_request
+            self._sound_request = None
+            return req
 
     def get_command(self):
         with self._lock:
@@ -198,6 +242,15 @@ class PolicyRunner:
         self._interrupted = False
         self._sigint_count = 0
 
+        # Map head/neck joint names → indices in dof_targets (only on hardware backend)
+        self._head_joint_indices = {}
+        self._head_smooth = {}
+        if hasattr(backend, 'all_joint_names') and hasattr(backend, 'num_policy_joints'):
+            for i, name in enumerate(backend.all_joint_names[backend.num_policy_joints:],
+                                     start=backend.num_policy_joints):
+                self._head_joint_indices[name] = i
+                self._head_smooth[name] = 0.0
+
 
     def _handle_sigint(self, signum, frame):
         self._sigint_count += 1
@@ -255,9 +308,32 @@ class PolicyRunner:
             return
 
         self.backend.activate_policy_gains()
-        
+
+        # --- Audio setup ---
+        _audio_proc = None
+        _all = sorted(Path("assets").glob("*.wav")) if Path("assets").exists() else []
+        _test = [f for f in _all if f.name == "test.wav"]
+        _others = [f for f in _all if f.name != "test.wav"]
+        _wav_files = _others[:8] + _test  # test.wav pinned to key 9
+        vol = int(151 * 65 / 100)  # 65% volume
+        subprocess.run(["amixer", "-c", "2", "cset", "numid=4", f"{vol},{vol}"], capture_output=True)
+        subprocess.run(["amixer", "-c", "2", "sset", "PCM Playback Switch", "on"], capture_output=True)
+        _startup_sound = Path("assets/test.wav")
+        if _startup_sound.exists():
+            print(f"[Audio] Playing: {_startup_sound.name}")
+            _audio_proc = subprocess.Popen(
+                ["aplay", "-D", "plughw:2,0", "-q", str(_startup_sound)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+
         print("\n" + "=" * 50)
         print("  DEPLOYING POLICY (LIVE MODE)")
+        print("=" * 50)
+        print("  Locomotion:  W/S=fwd/back  A/D=strafe  Q/E=turn  SPACE=stop")
+        if self._head_joint_indices:
+            print("  Head:        I/K=neck  J/L=head pitch  [/]=head yaw")
+        if _wav_files:
+            print(f"  Sounds:      1-9=play  0=stop  ({len(_wav_files)} files in assets/)")
         print("=" * 50)
 
         it = 0
@@ -270,6 +346,20 @@ class PolicyRunner:
 
         while self.backend.is_running() and not self.kb.should_quit and not self._interrupted:
             loop_start = time.perf_counter()
+
+            # --- SOUND HANDLING ---
+            sound_req = self.kb.get_sound_request()
+            if sound_req is not None:
+                if _audio_proc and _audio_proc.poll() is None:
+                    _audio_proc.terminate()
+                    _audio_proc = None
+                if sound_req > 0:
+                    idx = sound_req - 1
+                    if idx < len(_wav_files):
+                        _audio_proc = subprocess.Popen(
+                            ["aplay", "-D", "plughw:2,0", "-q", str(_wav_files[idx])],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        )
 
             # --- POLICY UPDATE STEP (e.g. 50Hz) ---
             if it % self.decimation == 0:
@@ -327,6 +417,15 @@ class PolicyRunner:
             # Calculate final targets using the smoothed action
             action_delta = self.current_interpolated_actions * self.action_scale
             self.dof_targets[self.joint_map] = self.default_pos[self.joint_map] + action_delta
+
+            # Apply head/neck offsets — smoothed so motion isn't jerky
+            if self._head_joint_indices:
+                head_offsets = self.kb.get_head_offsets()
+                for name, idx in self._head_joint_indices.items():
+                    if name in head_offsets:
+                        target = head_offsets[name]
+                        self._head_smooth[name] += 0.05 * (target - self._head_smooth[name])
+                        self.dof_targets[idx] = self._head_smooth[name]
             
             # =================================================================
             # [SAFETY OVERRIDE] 
@@ -334,7 +433,7 @@ class PolicyRunner:
             #self.dof_targets[self.joint_map] = self.default_pos[self.joint_map].copy()
             # =================================================================
 
-            self._filtered_targets = 0.1 * self._filtered_targets + 0.9 * self.dof_targets
+            self._filtered_targets = 0.0 * self._filtered_targets + 1 * self.dof_targets
             self.backend.set_joint_targets(self._filtered_targets)
             self.backend.step()
             ctrl_ticks += 1
@@ -342,8 +441,8 @@ class PolicyRunner:
             loop_end = time.perf_counter()
             loop_times.append(loop_end - loop_start)
 
-            # --- DEBUG CONSOLE OUTPUT (Runs every ~0.5 seconds) ---
-            if it % 100 == 0 and it > 0:
+            # --- DEBUG CONSOLE OUTPUT (Runs every ~1 second at 400Hz ctrl) ---
+            if it % 400 == 0 and it > 0:
                 l_arr = np.array(loop_times) * 1000 
                 loop_times =[] 
                 
@@ -375,6 +474,9 @@ class PolicyRunner:
                 print("-" * 55)
                 
             it += 1
+
+        if _audio_proc and _audio_proc.poll() is None:
+            _audio_proc.terminate()
 
         self._cleanup()
         signal.signal(signal.SIGINT, old_handler)

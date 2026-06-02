@@ -209,12 +209,13 @@ JOINT_LIMITS = {
     "Right_Knee":      (-1.3, 0.94),
     "Right_Ankle":     (-1.2, 0.84),
     "Neck_Pitch":      (-0.35, 0.87),
-    "Head_Pitch":      (-1.05, 0.87),
-    "Head_Yaw":        (-0.87, 0.87),
-    "Head_Roll":       (-0.52, 0.52),
+    "Head_Pitch":      (-0.87, 0.87),
+    "Head_Yaw":        (-1.05, 1.05),
+    "Head_Roll":       (-0.87, 0.87),
 }
 
 CAN_CHANNELS =["can2", "can1", "can0"]
+HEAD_HOLD_JOINTS = {"Neck_Pitch", "Head_Pitch", "Head_Yaw", "Head_Roll"}
 LPF_ALPHA_POS = 1.0  # Pass raw positions (No delay)
 LPF_ALPHA_VEL = 1.0  # Filter velocities (Smooths out the noise)
 
@@ -222,7 +223,7 @@ LPF_ALPHA_VEL = 1.0  # Filter velocities (Smooths out the noise)
 FALL_ANGLE_DEG = 45.0
 FALL_THRESHOLD = math.cos(math.radians(FALL_ANGLE_DEG))  # 0.707
 # Safety: enter damping mode if any policy joint target exceeds this (rad)
-MAX_TARGET_RAD = 1.0
+MAX_TARGET_RAD = 1.5
 
 
 # ==========================================
@@ -267,10 +268,11 @@ class HardwareBackend(RobotBackend):
         self.num_policy_joints = len(self.policy_joints)
         self.all_joint_names = list(self.policy_joints)
 
-        # If --legs is flagged, hold Neck_Pitch stiff (Head_Pitch/Yaw/Roll removed)
+        # If --legs is flagged, hold all head/neck joints at 0 with standup gains
         if self.legs_only:
-            if "Neck_Pitch" not in self.all_joint_names:
-                self.all_joint_names.append("Neck_Pitch")
+            for head_joint in ["Neck_Pitch", "Head_Pitch", "Head_Yaw", "Head_Roll"]:
+                if head_joint not in self.all_joint_names:
+                    self.all_joint_names.append(head_joint)
 
         self.num_joints = len(self.all_joint_names)
 
@@ -329,7 +331,11 @@ class HardwareBackend(RobotBackend):
                     can.Message(arbitration_id=enable_id, is_extended_id=True, dlc=8)
                 )
                 enabled_on_bus[bus_idx].add(motor_id)
-        time.sleep(0.5)
+        # Send zero-torque MIT commands to trigger feedback so we get real positions
+        for bus_idx, motor_id, motor_type in self._joint_wiring:
+            params = MOTOR_TYPE_PARAMS[motor_type]
+            _send_mit_command(self.buses[bus_idx], motor_id, 0.0, 0.0, 0.0, 0.0, 0.0, params)
+        time.sleep(0.1)
 
         self._update_motor_states()
         for i, (bus_idx, motor_id, _) in enumerate(self._joint_wiring):
@@ -461,8 +467,8 @@ class HardwareBackend(RobotBackend):
             name = self.all_joint_names[i].strip()
             params = MOTOR_TYPE_PARAMS[motor_type]
 
-            # Determine if this is a "headless" joint that the policy knows nothing about
-            is_fixed_head_joint = self.legs_only and i >= self.num_policy_joints
+            # Name-based check so head joints are fixed even if present in the policy
+            is_fixed_head_joint = self.legs_only and name in HEAD_HOLD_JOINTS
 
             if use_standup_gains or is_fixed_head_joint:
                 if name in STANDUP_GAINS:
@@ -474,7 +480,7 @@ class HardwareBackend(RobotBackend):
                 kd = self._policy_kd[i]
 
             pos = float(targets[i])
-            if name in JOINT_LIMITS:
+            if name in JOINT_LIMITS and not is_fixed_head_joint:
                 lo, hi = JOINT_LIMITS[name]
                 pos = float(np.clip(pos, lo, hi))
 
@@ -490,6 +496,12 @@ class HardwareBackend(RobotBackend):
     def standup(self, duration: float = 2.0) -> None:
         dur = duration if duration else self._standup_duration
         print(f"Standing up over {dur}s...")
+
+        # Poll all motors to get fresh actual positions before interpolating
+        for bus_idx, motor_id, motor_type in self._joint_wiring:
+            params = MOTOR_TYPE_PARAMS[motor_type]
+            _send_mit_command(self.buses[bus_idx], motor_id, 0.0, 0.0, 0.0, 0.0, 0.0, params)
+        time.sleep(0.1)
 
         self._read_and_filter()
         start_pos = self._filtered_positions.copy()

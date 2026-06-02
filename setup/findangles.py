@@ -9,7 +9,7 @@ FULL_ROTATION = 2 * 3.14159
 CAN_CONFIGS = [
     ('can2', [1,2,3,4,5]),
     ('can1', [6,7,8,9,10]),
-    ('can0', [11,12,13,14]),
+    ('can0', [11,12,13,14, 127]),
 ]
 
 MOTOR_TYPE_PARAMS = {
@@ -215,7 +215,7 @@ try:
     print("\nRotate the motors by hand. Press Ctrl+C to stop.")
     print("Recording min/max angles from the LOW-LEVEL OPERATIONAL encoder...")
 
-    target_dt = 1.0 / 400.0  # 400 Hz loop target
+    target_dt = 1.0 / 200.0  # 200 Hz loop target
 
     last_print_time = time.time()
     loops_completed = 0
@@ -224,13 +224,13 @@ try:
         loop_start = time.time()
         output_lines = []
         
-        # 1. Quickly trigger feedback updates from all motors concurrently
+        # 1. Read responses from the previous cycle's polls (they've had time to arrive)
+        update_all_motor_states_from_buffer(buses)
+
+        # 2. Send new polls — responses will arrive during the sleep at end of this cycle
         for bus, motor_ids in zip(buses, motor_ids_list):
             for motor_id in motor_ids:
                 poll_motor_state(bus, motor_id)
-                
-        # 2. Extract feedback instantly from CAN bus without blocking SDO timeouts
-        update_all_motor_states_from_buffer(buses)
 
         for client, bus, motor_ids in zip(clients, buses, motor_ids_list):
             for motor_id in motor_ids:
@@ -255,9 +255,9 @@ try:
         current_time = time.time()
         
         # Calculate actual Hz & print to terminal once per second
-        if current_time - last_print_time >= 1.0:
+        if current_time - last_print_time >= 0.05:
             actual_hz = loops_completed / (current_time - last_print_time)
-            header = f"--- CAN Bus Performance: {actual_hz:.2f} Hz | Target: 400.00 Hz ---"
+            header = f"--- CAN Bus Performance: {actual_hz:.2f} Hz | Target: 200.00 Hz ---"
             
             if output_lines:
                 print(header)

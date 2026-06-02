@@ -11,7 +11,7 @@ def main():
     parser = argparse.ArgumentParser(description="BDX-R Deploy — sim or real")
     parser.add_argument("--backend", type=str, default="sim", choices=["sim", "real"],
                         help="Backend: 'sim' for MuJoCo, 'real' for hardware")
-    parser.add_argument("--model", type=str, default="models/uni2.onnx",
+    parser.add_argument("--model", type=str, default="models/pushhard.onnx",
                         help="Path to ONNX policy model")
     
     # --- XML PATHS ---
@@ -22,9 +22,11 @@ def main():
     
     parser.add_argument("--sim_dt", type=float, default=0.02,
                         help="Simulation timestep (sim only)")
+    parser.add_argument("--ctrl_hz", type=float, default=400.0,
+                        help="Motor control rate in Hz (real hardware only, default 400 Hz). Policy still runs at 50 Hz.")
     parser.add_argument("--decimation", type=int, default=None,
-                        help="Control decimation (policy runs every N steps). Defaults to round(0.02/sim_dt) to target 50 Hz policy.")
-    
+                        help="Control decimation (policy runs every N steps). Defaults to ctrl_hz/50 for real, round(0.02/sim_dt) for sim.")
+
     # --- LEGS ONLY FLAG ---
     parser.add_argument("--legs", action="store_true", 
                         help="Hold the head joints fixed and only deploy the legs policy")
@@ -35,7 +37,10 @@ def main():
     
     args = parser.parse_args()
     if args.decimation is None:
-        args.decimation = max(1, round(0.02 / args.sim_dt))  # target 50 Hz policy
+        if args.backend == "real":
+            args.decimation = max(1, round(args.ctrl_hz / 50))  # 400Hz motor / 50Hz policy = 8
+        else:
+            args.decimation = max(1, round(0.02 / args.sim_dt))  # target 50 Hz policy
     model_path = Path(args.model)
 
     # ==========================================
@@ -87,7 +92,7 @@ def main():
         from bdx_api.hardware import HardwareBackend
         backend = HardwareBackend(
             model_path=model_path,
-            loop_dt=args.sim_dt,
+            loop_dt=1.0 / args.ctrl_hz,
             legs_only=args.legs,
             use_imu=not args.no_imu
         )
