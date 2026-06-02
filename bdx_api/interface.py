@@ -10,7 +10,7 @@ import onnxruntime as ort
 from abc import ABC, abstractmethod
 from pathlib import Path
 
-from bdx_api.config import load_policy_config, RobotPolicyConfig
+from bdx_api.config import load_policy_config, load_isaaclab_config, RobotPolicyConfig
 from bdx_api.logger import RuntimeLogger
 
 
@@ -206,9 +206,10 @@ class PyTorchPolicyBackend(BasePolicyBackend):
 # Policy Runner
 # ==========================================
 class PolicyRunner:
-    def __init__(self, backend: RobotBackend, model_path: Path, decimation: int = 4):
+    def __init__(self, backend: RobotBackend, model_path: Path, decimation: int = 4,
+                 cfg_override: RobotPolicyConfig = None):
         self.backend = backend
-        self.cfg: RobotPolicyConfig = load_policy_config(model_path)
+        self.cfg: RobotPolicyConfig = cfg_override if cfg_override is not None else load_policy_config(model_path)
         
         # --- NEW: Automatically pick ONNX or PyTorch adapter ---
         if model_path.suffix == '.onnx':
@@ -229,7 +230,7 @@ class PolicyRunner:
             self.default_pos[mj_id] = self.cfg.default_joint_pos[i]
 
         self.action_scale = np.array(self.cfg.action_scale, dtype=np.float32)
-        
+
         self.new_actions = np.zeros(len(self.cfg.joint_names), dtype=np.float32)
         self.prev_actions = np.zeros(len(self.cfg.joint_names), dtype=np.float32)
         self.current_interpolated_actions = np.zeros(len(self.cfg.joint_names), dtype=np.float32)
@@ -377,12 +378,12 @@ class PolicyRunner:
                     scale = self.cfg.obs_scales.get(term, 1.0)
 
                     # --- NEW: Apply the scale to each append! ---
-                    if term == "projected_gravity": obs_parts.append(projected_gravity * scale)
-                    elif term == "base_ang_vel": obs_parts.append(ang_vel * scale)
+                    if term in ("projected_gravity", "imu_projected_gravity"): obs_parts.append(projected_gravity * scale)
+                    elif term in ("base_ang_vel", "imu_ang_vel"): obs_parts.append(ang_vel * scale)
                     elif term in ("joint_pos", "dof_pos"): obs_parts.append((dof_pos - self.default_pos[self.joint_map]) * scale)
                     elif term in ("joint_vel", "dof_vel"): obs_parts.append(dof_vel * scale)
-                    elif term == "actions": obs_parts.append(self.prev_actions * scale) # NOTE: use prev_actions for history, Isaac usually wants history, not current 0s
-                    elif term in ("command", "commands"): obs_parts.append(cmd * scale)
+                    elif term == "actions": obs_parts.append(self.prev_actions * scale)
+                    elif term in ("command", "commands", "velocity_commands"): obs_parts.append(cmd * scale)
 
                 obs = np.concatenate(obs_parts).astype(np.float32)
 
@@ -481,7 +482,179 @@ class PolicyRunner:
         self._cleanup()
         signal.signal(signal.SIGINT, old_handler)
         print(f"\n\nRun complete. {len(self.logger.entries)} samples logged.")
-        
+
+        if self._interrupted and len(self.logger.entries) > 1:
+            print("\nGenerating plots...")
+            self.logger.plot(save_dir="logs")
+
+        print("Shutting down.")
+
+
+# ==========================================
+# Imitation Policy Runner
+# ==========================================
+class ImitationPolicyRunner(PolicyRunner):
+    """PolicyRunner extended with gait-phase + reference-motion observations."""
+
+    POLICY_DT = 0.02  # 50 Hz control rate
+
+    def __init__(self, backend: RobotBackend, model_path: Path, decimation: int,
+                 cfg_override, pkl_path: str):
+        super().__init__(backend, model_path, decimation, cfg_override)
+
+        import torch
+        import importlib.util, sys
+        spec = importlib.util.spec_from_file_location(
+            "reference_motion_legs",
+            Path(__file__).resolve().parents[1] / "imitate" / "reference_motion_legs.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        ReferenceMotionLibraryLegs = mod.ReferenceMotionLibraryLegs
+        self._torch = torch
+        self.lib = ReferenceMotionLibraryLegs(pkl_path, device="cpu")
+        self.phase = 0.0
+        self._clip_idx = None
+
+    def _update_clip(self, cmd: np.ndarray):
+        torch = self._torch
+        cmd_t = torch.tensor([[cmd[0], cmd[1], cmd[2]]], dtype=torch.float32)
+        self._clip_idx = self.lib.nearest_clip(cmd_t)  # shape (1,)
+
+    def _step_phase(self):
+        torch = self._torch
+        period = self.lib.period(self._clip_idx).item()
+        self.phase = (self.phase + self.POLICY_DT / period) % 1.0
+
+    def _get_ref_jpos(self) -> np.ndarray:
+        torch = self._torch
+        phase_t = torch.tensor([self.phase], dtype=torch.float32)
+        _, _, ref_jpos, _, _ = self.lib.query(self._clip_idx, phase_t)
+        return ref_jpos[0].numpy()
+
+    def run(self):
+        import math
+        old_handler = signal.signal(signal.SIGINT, self._handle_sigint)
+        atexit.register(self._cleanup)
+
+        print("\n" + "=" * 50)
+        print("  READY TO STAND  [IMITATION MODE]")
+        print("=" * 50)
+        input(">>> Press ENTER to stand up (safe standing gains)...")
+        self.backend.standup(duration=2.0)
+
+        print("\nRobot is standing. Place it on the floor.")
+        print(">>> Press ENTER to deploy the imitation policy...")
+
+        enter_pressed = threading.Event()
+        def _wait_for_enter():
+            input()
+            enter_pressed.set()
+        waiter = threading.Thread(target=_wait_for_enter, daemon=True)
+        waiter.start()
+
+        while not enter_pressed.is_set() and self.backend.is_running():
+            self.backend.hold_standing_tick()
+
+        self.backend.activate_policy_gains()
+
+        print("\n" + "=" * 50)
+        print("  DEPLOYING IMITATION POLICY (LIVE MODE)")
+        print("=" * 50)
+
+        it = 0
+        loop_times = []
+        freq_start_time = time.time()
+        ctrl_ticks = 0
+        policy_ticks = 0
+
+        # Seed phase and clip with the initial command
+        cmd = self.kb.get_command()
+        self._update_clip(cmd)
+
+        while self.backend.is_running() and not self.kb.should_quit and not self._interrupted:
+            loop_start = time.perf_counter()
+
+            if it % self.decimation == 0:
+                cmd = self.kb.get_command()
+                self._update_clip(cmd)
+                self._step_phase()
+                ref_jpos = self._get_ref_jpos()
+
+                ang_vel = self.backend.get_imu_angular_velocity()
+                projected_gravity = self.backend.get_projected_gravity()
+                dof_pos = self.backend.get_joint_positions(self.joint_map)
+                dof_vel = self.backend.get_joint_velocities(self.joint_map)
+
+                sin_phase = math.sin(self.phase * 2.0 * math.pi)
+                cos_phase = math.cos(self.phase * 2.0 * math.pi)
+
+                obs = np.concatenate([
+                    ang_vel,
+                    projected_gravity,
+                    dof_pos - self.default_pos[self.joint_map],
+                    dof_vel,
+                    self.prev_actions,
+                    cmd,
+                    np.array([sin_phase, cos_phase], dtype=np.float32),
+                    ref_jpos,
+                ]).astype(np.float32)
+
+                self.prev_actions = self.new_actions.copy()
+                self.new_actions = self.model.get_action(obs)
+                policy_ticks += 1
+
+                self.logger.log(
+                    cmd=cmd,
+                    target_pos=self.dof_targets[self.joint_map],
+                    actual_pos=dof_pos,
+                    actual_vel=dof_vel,
+                    ang_vel=ang_vel,
+                    projected_gravity=projected_gravity,
+                    actions=self.new_actions,
+                )
+
+            if self.decimation > 1:
+                alpha = (it % self.decimation) / float(self.decimation - 1)
+                self.current_interpolated_actions = (1.0 - alpha) * self.prev_actions + alpha * self.new_actions
+            else:
+                self.current_interpolated_actions = self.new_actions
+
+            action_delta = self.current_interpolated_actions * self.action_scale
+            self.dof_targets[self.joint_map] = self.default_pos[self.joint_map] + action_delta
+
+            self.backend.set_joint_targets(self.dof_targets)
+            self.backend.step()
+            ctrl_ticks += 1
+
+            loop_end = time.perf_counter()
+            loop_times.append(loop_end - loop_start)
+
+            if it % 100 == 0 and it > 0:
+                l_arr = np.array(loop_times) * 1000
+                loop_times = []
+                now = time.time()
+                dt = now - freq_start_time
+                actual_ctrl_hz = ctrl_ticks / dt
+                actual_pol_hz = policy_ticks / dt
+                freq_start_time = now
+                ctrl_ticks = 0
+                policy_ticks = 0
+
+                print("\n" + "-" * 55)
+                print(f"[IMITATION TICK {it}]")
+                print(f"  Frequencies:   Control = {actual_ctrl_hz:5.1f} Hz | Policy = {actual_pol_hz:5.1f} Hz")
+                print(f"  Loop Timing:   Avg {l_arr.mean():.2f}ms | Max {l_arr.max():.2f}ms")
+                print(f"  Phase:         {self.phase:.3f}  cmd: {cmd}")
+                print(f"  Proj Gravity:  {projected_gravity}")
+                print("-" * 55)
+
+            it += 1
+
+        self._cleanup()
+        signal.signal(signal.SIGINT, old_handler)
+        print(f"\n\nRun complete. {len(self.logger.entries)} samples logged.")
+
         if self._interrupted and len(self.logger.entries) > 1:
             print("\nGenerating plots...")
             self.logger.plot(save_dir="logs")

@@ -520,6 +520,17 @@
     <velocimeter name="imu_lin_vel" site="imu"/>
     <accelerometer name="imu_lin_acc" site="imu"/>
     <subtreeangmom name="root_angmom" body="base_link"/>
+        <!-- NEW: System ID position sensors. Names MUST match CSV column names -->
+    <jointpos name="pos_0" joint="Left_Hip_Yaw"/>
+    <jointpos name="pos_1" joint="Left_Hip_Roll"/>
+    <jointpos name="pos_2" joint="Left_Hip_Pitch"/>
+    <jointpos name="pos_3" joint="Left_Knee"/>
+    <jointpos name="pos_4" joint="Left_Ankle"/>
+    <jointpos name="pos_5" joint="Right_Hip_Yaw"/>
+    <jointpos name="pos_6" joint="Right_Hip_Roll"/>
+    <jointpos name="pos_7" joint="Right_Hip_Pitch"/>
+    <jointpos name="pos_8" joint="Right_Knee"/>
+    <jointpos name="pos_9" joint="Right_Ankle"/>
   </sensor>
 
   <actuator>

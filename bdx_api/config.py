@@ -50,7 +50,7 @@ class RobotPolicyConfig:
     action_scale: List[float]
     observation_names: List[str]
     command_names: List[str]
-    obs_scales: Dict[str, float]  # <--- NEW FIELD
+    obs_scales: Dict[str, float]
 
 
 # ==========================================
@@ -126,17 +126,27 @@ def load_policy_config(model_path: Path = None) -> RobotPolicyConfig:
             if key not in metadata:
                 raise KeyError(f"Missing required ONNX metadata key: '{key}'")
 
+        joint_names = _parse_str_list(metadata["joint_names"])
+        joint_stiffness = _parse_float_list(metadata["joint_stiffness"])
+        joint_damping = _parse_float_list(metadata["joint_damping"])
+
+        # Detect broken export (Kp all ~1.0, Kd all ~0.0) and fall back to known-good gains
+        if all(abs(kp - 1.0) < 0.01 for kp in joint_stiffness):
+            print("[WARNING] ONNX gains look broken (Kp=1.0, Kd≈0). Using POLICY_GAINS_FALLBACK.")
+            joint_stiffness = [POLICY_GAINS_FALLBACK[n][0] for n in joint_names]
+            joint_damping   = [POLICY_GAINS_FALLBACK[n][1] for n in joint_names]
+
         return RobotPolicyConfig(
             obs_dim=obs_dim,
             action_dim=action_dim,
-            joint_names=_parse_str_list(metadata["joint_names"]),
-            joint_stiffness=_parse_float_list(metadata["joint_stiffness"]),
-            joint_damping=_parse_float_list(metadata["joint_damping"]),
+            joint_names=joint_names,
+            joint_stiffness=joint_stiffness,
+            joint_damping=joint_damping,
             default_joint_pos=_parse_float_list(metadata["default_joint_pos"]),
             action_scale=_parse_float_list(metadata["action_scale"]),
             observation_names=_parse_str_list(metadata["observation_names"]),
             command_names=_parse_str_list(metadata.get("command_names", "lin_vel_x,lin_vel_y,ang_vel_z")),
-            obs_scales={}  # Empty dict for ONNX (since you don't use it there)
+            obs_scales={}
         )
     else:
         raise ValueError(f"Unsupported model extension: {model_path.suffix}. Use .onnx or .pt")
@@ -185,6 +195,79 @@ POLICY_GAINS_FALLBACK = {
     "Head_Yaw":        (5.0, 3.0),
     "Head_Roll":       (5.0, 3.0),
 }
+
+# ==========================================
+# IsaacLab Hardcoded Config (from env.yaml)
+# ==========================================
+# Joint order follows URDF articulation order (preserve_order=False resolves to this)
+_ISAACLAB_JOINT_NAMES = [
+    "Left_Hip_Yaw",   "Right_Hip_Yaw",
+    "Left_Hip_Roll",  "Right_Hip_Roll",
+    "Left_Hip_Pitch", "Right_Hip_Pitch",
+    "Left_Knee",      "Right_Knee",
+    "Left_Ankle",     "Right_Ankle",
+]
+# Gains from env.yaml actuators: hips_and_knees kp=78.957, kd=5.027; ankles kp=16.581, kd=1.056
+_IL_KP = [78.957, 78.957, 78.957, 78.957, 78.957, 78.957, 78.957, 78.957, 16.581, 16.581]
+_IL_KD = [5.027,  5.027,  5.027,  5.027,  5.027,  5.027,  5.027,  5.027,  1.056,  1.056]
+
+def load_isaaclab_config() -> RobotPolicyConfig:
+    """
+    Returns the hardcoded config derived from the IsaacLab env.yaml.
+    Use this when deploying a policy trained in IsaacLab (--isaaclab flag).
+    Obs order: imu_ang_vel(3), imu_projected_gravity(3), joint_pos(10), joint_vel(10), actions(10), velocity_commands(3) = 39
+    Joint axes in the URDF match the MuJoCo XML exactly — no sign correction needed.
+    """
+    return RobotPolicyConfig(
+        obs_dim=39,
+        action_dim=10,
+        joint_names=_ISAACLAB_JOINT_NAMES,
+        joint_stiffness=_IL_KP,
+        joint_damping=_IL_KD,
+        default_joint_pos=[0.0] * 10,  # init_state.joint_pos: .*: 0.0
+        action_scale=[0.5] * 10,        # actions.joint_pos.scale: 0.5
+        observation_names=["imu_ang_vel", "imu_projected_gravity", "joint_pos", "joint_vel", "actions", "velocity_commands"],
+        command_names=["lin_vel_x", "lin_vel_y", "ang_vel_z"],
+        obs_scales={"imu_ang_vel": 0.2, "joint_vel": 0.05},  # from policy obs scales in env.yaml
+    )
+
+
+# ==========================================
+# Imitation Legs Config
+# ==========================================
+# Joint order: Left side first (Yaw, Roll, Pitch, Knee, Ankle), then Right side
+_IMITATION_JOINT_NAMES = [
+    "Left_Hip_Yaw",  "Left_Hip_Roll",  "Left_Hip_Pitch",  "Left_Knee",  "Left_Ankle",
+    "Right_Hip_Yaw", "Right_Hip_Roll", "Right_Hip_Pitch", "Right_Knee", "Right_Ankle",
+]
+_IMITATION_KP = [78.957, 78.957, 78.957, 78.957, 16.581,
+                 78.957, 78.957, 78.957, 78.957, 16.581]
+_IMITATION_KD = [5.027, 5.027, 5.027, 5.027, 1.056,
+                 5.027, 5.027, 5.027, 5.027, 1.056]
+# Per-joint action scales from training spec
+_IMITATION_ACTION_SCALE = [0.1330, 0.1330, 0.1330, 0.1330, 0.1643,
+                            0.1330, 0.1330, 0.1330, 0.1330, 0.1643]
+
+def load_imitation_config() -> RobotPolicyConfig:
+    """
+    Hardcoded config for the BDX-R imitation legs policy.
+    Obs (51): ang_vel(3), proj_grav(3), joint_pos(10), joint_vel(10),
+              actions(10), command(3), imitation_phase(2), ref_joint_pos(10)
+    """
+    return RobotPolicyConfig(
+        obs_dim=51,
+        action_dim=10,
+        joint_names=_IMITATION_JOINT_NAMES,
+        joint_stiffness=_IMITATION_KP,
+        joint_damping=_IMITATION_KD,
+        default_joint_pos=[0.0] * 10,
+        action_scale=_IMITATION_ACTION_SCALE,
+        observation_names=["base_ang_vel", "projected_gravity", "joint_pos", "joint_vel",
+                           "actions", "command", "imitation_phase", "ref_joint_pos"],
+        command_names=["lin_vel_x", "lin_vel_y", "ang_vel_z"],
+        obs_scales={},
+    )
+
 
 # ==========================================
 # Debug

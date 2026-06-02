@@ -3,13 +3,14 @@ import mujoco
 import mujoco.viewer
 from pathlib import Path
 
-from bdx_api.config import load_policy_config, STANDUP_GAINS
+from bdx_api.config import load_policy_config, load_isaaclab_config, STANDUP_GAINS, RobotPolicyConfig
 from bdx_api.interface import RobotBackend, quat_rotate_inverse
 
 class MujocoBackend(RobotBackend):
     def __init__(self, xml_path: str, model_path: Path, sim_dt: float = 0.005,
-                 fixed: bool = False, legs_only: bool = False):
-        self.cfg = load_policy_config(model_path)
+                 fixed: bool = False, legs_only: bool = False,
+                 cfg_override: RobotPolicyConfig = None):
+        self.cfg = cfg_override if cfg_override is not None else load_policy_config(model_path)
         self.fixed = fixed
         self.legs_only = legs_only
 
@@ -70,7 +71,8 @@ class MujocoBackend(RobotBackend):
         self.data = mujoco.MjData(self.model)
         mujoco.mj_resetData(self.model, self.data)
 
-        self.data.qpos[:3] =[0.0, 0.0, 0.33]
+        spawn_z = 0.25 if legs_only else 0.33
+        self.data.qpos[:3] = [0.0, 0.0, spawn_z]
         self.data.qpos[3:7] = [1.0, 0.0, 0.0, 0.0]
 
         # --- NEW: Bulletproof QPOS/QVEL mapping mapping ---
@@ -175,13 +177,36 @@ class MujocoBackend(RobotBackend):
     def set_joint_targets(self, targets: np.ndarray) -> None:
         self.data.ctrl[:] = targets
 
+# ADD THIS to the bottom of __init__ in sim.py:
+    # self._last_render_time = 0.0
+
     def step(self) -> None:
+        import time  # Ensure time is imported
+        
         if self._lock_base:
             self.data.qpos[:3] =[0.0, 0.0, 0.33]
             self.data.qpos[3:7] =[1.0, 0.0, 0.0, 0.0]
             self.data.qvel[:6] = 0.0
+            
         mujoco.mj_step(self.model, self.data)
-        self.viewer.sync()
+        
+        now = time.perf_counter()
+
+        # 1. Throttle the 3D viewer to ~60 FPS (Saves CPU)
+        if now - getattr(self, '_last_render_time', 0.0) > (1.0 / 60.0):
+            if self.viewer.is_running():
+                self.viewer.sync()
+            self._last_render_time = now
+
+        # 2. Real-Time Physics Throttle (Keeps deploy.py at exactly 200Hz / 50Hz)
+        expected_dt = self.model.opt.timestep
+        elapsed = time.perf_counter() - getattr(self, '_last_step_time', now)
+        sleep_time = expected_dt - elapsed
+        
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+            
+        self._last_step_time = time.perf_counter()
 
     def is_running(self) -> bool: return self.viewer.is_running()
 

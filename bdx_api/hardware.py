@@ -9,7 +9,7 @@ import numpy as np
 import can
 import serial
 
-from bdx_api.config import load_policy_config, STANDUP_GAINS, POLICY_GAINS_FALLBACK
+from bdx_api.config import load_policy_config, load_isaaclab_config, STANDUP_GAINS, POLICY_GAINS_FALLBACK, RobotPolicyConfig
 from bdx_api.interface import RobotBackend
 from pathlib import Path
 from scipy.spatial.transform import Rotation
@@ -232,11 +232,11 @@ MAX_TARGET_RAD = 1.5
 class HardwareBackend(RobotBackend):
     def __init__(self, model_path: Path, loop_dt: float = 0.005,
                  standup_duration: float = 2.0, imu_port: str = "/dev/ttyUSB0",
-                 legs_only: bool = False, use_imu: bool = True): # Add use_imu parameter
-        
-        self.use_imu = use_imu # Store it
+                 legs_only: bool = False, use_imu: bool = True, cfg_override: RobotPolicyConfig = None):
 
-        self.cfg = load_policy_config(model_path)
+        self.use_imu = use_imu
+
+        self.cfg = cfg_override if cfg_override is not None else load_policy_config(model_path)
 
         # Detect degenerate gains (Kp=1.0, Kd=0.0) and fall back to known-good values
         stiffness_degenerate = all(abs(k - 1.0) < 1e-6 for k in self.cfg.joint_stiffness)
@@ -248,7 +248,6 @@ class HardwareBackend(RobotBackend):
         else:
             self._policy_kp = list(self.cfg.joint_stiffness)
             self._policy_kd = list(self.cfg.joint_damping)
-
         self.loop_dt = loop_dt
         self._running = True
         self._last_time = time.time()
@@ -317,7 +316,7 @@ class HardwareBackend(RobotBackend):
             atexit.register(self.imu.stop)
         else:
             print("[WARN] IMU disabled. Using dummy values.")
-            self.imu = None # Or a dummy class if your code calls get_latest_data()
+            self.imu = None
 
         print("Enabling all motors...")
         time.sleep(0.5)
