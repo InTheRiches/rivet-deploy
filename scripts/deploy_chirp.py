@@ -7,6 +7,7 @@ import argparse
 import numpy as np
 import torch
 from pathlib import Path
+from bdx_api.actuator_specs import ROBSTRIDE_06_GAINS
 
 # Set Matplotlib backend to 'Agg' for headless environments (like Jetson Orin Nano)
 import matplotlib
@@ -27,12 +28,12 @@ SCALE = np.array([0.15, 0.15, 0.25, 0.3, 0.4,   0.15, 0.15, 0.25, 0.3, 0.4])
 DIR = np.array([1.0, 1.0,  1.0, -1.0,  1.0,       -1.0, -1.0, -1.0,  1.0, -1.0])
 
 HARDCODED_KP = np.array([
-    78.957, 78.957, 78.957, 78.957, 16.581,  # Left Leg Gains
-    78.957, 78.957, 78.957, 78.957, 16.581   # Right Leg Gains
+    ROBSTRIDE_06_GAINS[0], ROBSTRIDE_06_GAINS[0], 78.957, 78.957, 16.581,  # Left Leg Gains
+    ROBSTRIDE_06_GAINS[0], ROBSTRIDE_06_GAINS[0], 78.957, 78.957, 16.581   # Right Leg Gains
 ])
 HARDCODED_KD = np.array([
-    5.027, 5.027, 5.027, 5.027, 1.056,       # Left Leg Gains
-    5.027, 5.027, 5.027, 5.027, 1.056        # Right Leg Gains
+    ROBSTRIDE_06_GAINS[1], ROBSTRIDE_06_GAINS[1], 5.027, 5.027, 1.056,  # Left Leg Gains
+    ROBSTRIDE_06_GAINS[1], ROBSTRIDE_06_GAINS[1], 5.027, 5.027, 1.056   # Right Leg Gains
 ])
 
 
@@ -100,6 +101,11 @@ def main():
     object.__setattr__(backend.cfg, "joint_stiffness", mapped_kp.tolist())
     object.__setattr__(backend.cfg, "joint_damping", mapped_kd.tolist())
     object.__setattr__(backend.cfg, "default_joint_pos", mapped_startup.tolist())
+    # HardwareBackend caches policy gains separately from cfg at construction.
+    # Keep the chirp gains aligned with the mapped model order on real hardware.
+    if hasattr(backend, "_policy_kp"):
+        backend._policy_kp = mapped_kp.tolist()
+        backend._policy_kd = mapped_kd.tolist()
     
     if args.sim and hasattr(backend, '_apply_policy_gains'):
         backend._apply_policy_gains()

@@ -10,6 +10,7 @@ import can
 import serial
 
 from bdx_api.config import load_policy_config, load_isaaclab_config, STANDUP_GAINS, POLICY_GAINS_FALLBACK, RobotPolicyConfig
+from bdx_api.deployment import load_deployment_config
 from bdx_api.interface import RobotBackend
 from pathlib import Path
 from scipy.spatial.transform import Rotation
@@ -37,6 +38,13 @@ MOTOR_TYPE_PARAMS = {
         "P_MIN": -12.57, "P_MAX": 12.57,
         "V_MIN": -20.0,  "V_MAX": 20.0,
         "T_MIN": -60.0,  "T_MAX": 60.0,
+        "KP_MIN": 0.0,   "KP_MAX": 5000.0,
+        "KD_MIN": 0.0,   "KD_MAX": 100.0,
+    },
+    "O6": {
+        "P_MIN": -12.57, "P_MAX": 12.57,
+        "V_MIN": -50.0,  "V_MAX": 50.0,
+        "T_MIN": -36.0,  "T_MAX": 36.0,
         "KP_MIN": 0.0,   "KP_MAX": 5000.0,
         "KD_MIN": 0.0,   "KD_MAX": 100.0,
     },
@@ -180,23 +188,6 @@ class MTi_Serial_IMU:
 # Joint Definition
 # ==========================================
 
-JOINT_WIRING = {
-    "Left_Hip_Yaw":    (0, 1,  "O3"),
-    "Left_Hip_Roll":   (0, 2,  "O3"),
-    "Left_Hip_Pitch":  (0, 3,  "O3"),
-    "Left_Knee":       (0, 4,  "O3"),
-    "Left_Ankle":      (0, 5,  "O2"),
-    "Right_Hip_Yaw":   (1, 6,  "O3"),
-    "Right_Hip_Roll":  (1, 7,  "O3"),
-    "Right_Hip_Pitch": (1, 8,  "O3"),
-    "Right_Knee":      (1, 9,  "O3"),
-    "Right_Ankle":     (1, 10, "O2"),
-    "Neck_Pitch":      (2, 11, "O2"),
-    "Head_Pitch":      (2, 12, "O5"),
-    "Head_Yaw":        (2, 13, "O5"),
-    "Head_Roll":       (2, 14, "O5"),
-}
-
 JOINT_LIMITS = {
     "Left_Hip_Yaw":    (-0.4, 0.4),
     "Left_Hip_Roll":   (-0.34, 0.34),
@@ -214,7 +205,6 @@ JOINT_LIMITS = {
     "Head_Roll":       (-0.87, 0.87),
 }
 
-CAN_CHANNELS =["can2", "can1", "can0"]
 HEAD_HOLD_JOINTS = {"Neck_Pitch", "Head_Pitch", "Head_Yaw", "Head_Roll"}
 LPF_ALPHA_POS = 1.0  # Pass raw positions (No delay)
 LPF_ALPHA_VEL = 1.0  # Filter velocities (Smooths out the noise)
@@ -232,9 +222,13 @@ MAX_TARGET_RAD = 1.5
 class HardwareBackend(RobotBackend):
     def __init__(self, model_path: Path, loop_dt: float = 0.005,
                  standup_duration: float = 2.0, imu_port: str = "/dev/ttyUSB0",
-                 legs_only: bool = False, use_imu: bool = True, cfg_override: RobotPolicyConfig = None):
+                 imu_backend: str = "orbbec",
+                 legs_only: bool = False, use_imu: bool = True, cfg_override: RobotPolicyConfig = None,
+                 deployment_config_path: str | Path | None = None):
 
         self.use_imu = use_imu
+        self._deployment_path, self._deployment = load_deployment_config(deployment_config_path)
+        self._can_channels = list(self._deployment["can_channels"])
 
         self.cfg = cfg_override if cfg_override is not None else load_policy_config(model_path)
 
@@ -257,6 +251,8 @@ class HardwareBackend(RobotBackend):
         self._debug_tick_count = 0
         self._debug_start_time = time.time()
         self._actual_cmd_freq = 0.0
+        self._policy_authority = 1.0
+        self._buses_closed = False
 
         # Asimov Latency Tracking
         self._cmd_sent_time = {}
@@ -276,11 +272,19 @@ class HardwareBackend(RobotBackend):
         self.num_joints = len(self.all_joint_names)
 
         self._joint_wiring =[]
+        self._joint_directions = []
         for name in self.all_joint_names:
             name = name.strip()
-            if name not in JOINT_WIRING:
-                raise ValueError(f"Policy joint '{name}' has no entry in JOINT_WIRING.")
-            self._joint_wiring.append(JOINT_WIRING[name])
+            entry = self._deployment["joints"].get(name)
+            if entry is None:
+                raise ValueError(f"Policy joint '{name}' has no entry in config/rivet_deployment.yaml.")
+            if not entry.get("id_verified", False):
+                raise RuntimeError(f"Motor ID for {name} is not verified; run scripts/commission_rivet.py verify-ids first.")
+            if not entry.get("direction_verified", False):
+                raise RuntimeError(f"Motor direction for {name} is not verified; run scripts/commission_rivet.py check-directions first.")
+            bus_idx = self._can_channels.index(entry["can_interface"])
+            self._joint_wiring.append((bus_idx, entry["motor_id"], entry["motor_type"]))
+            self._joint_directions.append(entry.get("direction", 1))
 
         self._motor_type_by_id = {}
         for bus_idx, motor_id, motor_type in self._joint_wiring:
@@ -289,7 +293,7 @@ class HardwareBackend(RobotBackend):
 
         print("Initializing CAN buses...")
         self.buses =[]
-        for ch in CAN_CHANNELS:
+        for ch in self._can_channels:
             bus = can.interface.Bus(interface="socketcan", channel=ch)
             self.buses.append(bus)
         atexit.register(self._shutdown_buses)
@@ -310,7 +314,22 @@ class HardwareBackend(RobotBackend):
         
         print("Initializing IMU...")
         if self.use_imu:
-            self.imu = MTi_Serial_IMU(port=imu_port)
+            if imu_backend == "orbbec":
+                from bdx_api.orbbec_imu import OrbbecIMU
+
+                imu_config = self._deployment.get("imu", {})
+                if not isinstance(imu_config, dict):
+                    raise ValueError("The deployment map's imu section must be a YAML mapping")
+                self.imu = OrbbecIMU(
+                    sensor_to_base_rotation=imu_config.get("sensor_to_base_rotation"),
+                    stale_after_s=float(imu_config.get("stale_after_s", 0.25)),
+                    gravity_time_constant_s=float(imu_config.get("gravity_time_constant_s", 0.5)),
+                    gyro_bias_samples=int(imu_config.get("gyro_bias_samples", 50)),
+                )
+            elif imu_backend == "xsens":
+                self.imu = MTi_Serial_IMU(port=imu_port)
+            else:
+                raise ValueError(f"Unsupported IMU backend: {imu_backend!r}")
             if not self.imu.start():
                 raise RuntimeError("IMU initialization failed")
             atexit.register(self.imu.stop)
@@ -337,16 +356,31 @@ class HardwareBackend(RobotBackend):
         time.sleep(0.1)
 
         self._update_motor_states()
+        stale_joints = [
+            name for name, (_, motor_id, _) in zip(self.all_joint_names, self._joint_wiring)
+            if self._motor_states[motor_id]["updated_at"] == 0
+            or time.time() - self._motor_states[motor_id]["updated_at"] > 1.0
+        ]
+        if stale_joints:
+            self._shutdown_buses()
+            raise RuntimeError(
+                "No fresh CAN feedback for: " + ", ".join(stale_joints)
+                + ". Check CAN wiring, motor IDs, and power before deployment."
+            )
         for i, (bus_idx, motor_id, _) in enumerate(self._joint_wiring):
-            self._filtered_positions[i] = self._motor_states[motor_id]["pos"]
+            self._filtered_positions[i] = self._motor_states[motor_id]["pos"] * self._joint_directions[i]
         self._initialized_filter = True
 
         self._standup_duration = standup_duration
         self._in_damping_mode = False
+        # Keep the measured pose supported while the operator reviews the ready prompt.
+        self._send_targets(self._filtered_positions.copy(), use_standup_gains=True)
         print("\nHardware backend ready.")
 
     def _shutdown_buses(self):
-        # ... (Identical to original) ...
+        if getattr(self, "_buses_closed", False):
+            return
+        self._buses_closed = True
         print("Disabling all motors...")
         disabled = set()
         for bus_idx, motor_id, _ in self._joint_wiring:
@@ -360,12 +394,14 @@ class HardwareBackend(RobotBackend):
                     pass
                 disabled.add(motor_id)
 
-        for bus in self.buses:
-            bus.shutdown()
+        for bus in getattr(self, "buses", []):
+            try:
+                bus.shutdown()
+            except Exception:
+                pass
         print("CAN buses shut down.")
 
     def _update_motor_states(self):
-        # ... (Identical to original) ...
         for bus in self.buses:
             while True:
                 msg = bus.recv(timeout=0)
@@ -409,6 +445,9 @@ class HardwareBackend(RobotBackend):
         for i, (bus_idx, motor_id, _) in enumerate(self._joint_wiring):
             raw_pos = self._motor_states[motor_id]["pos"]
             raw_vel = self._motor_states[motor_id]["vel"]
+            direction = self._joint_directions[i]
+            raw_pos *= direction
+            raw_vel *= direction
 
             if self._initialized_filter:
                 # Use POS alpha for positions (1.0 = raw)
@@ -429,13 +468,17 @@ class HardwareBackend(RobotBackend):
     def _send_targets(self, targets: np.ndarray, use_standup_gains: bool = False):
         # ---- Safety checks (policy mode only, not during standup/hold) ----
         if not use_standup_gains and not self._in_damping_mode:
+            if self.use_imu and hasattr(self.imu, "is_fresh") and not self.imu.is_fresh():
+                self._enter_damping_mode("IMU data is stale; policy control has been stopped")
+
             # Check 1: fall detection via projected gravity
-            pg = self.get_projected_gravity()
-            gz = float(pg[2])  # upright = -1.0; fallen > 45° means gz > -0.707
-            if gz > -FALL_THRESHOLD:
-                self._enter_damping_mode(
-                    f"Robot has fallen! projected_gravity_z={gz:.3f} (threshold={-FALL_THRESHOLD:.3f})"
-                )
+            if self.use_imu and not self._in_damping_mode:
+                pg = self.get_projected_gravity()
+                gz = float(pg[2])  # upright = -1.0; fallen > 45° means gz > -0.707
+                if gz > -FALL_THRESHOLD:
+                    self._enter_damping_mode(
+                        f"Robot has fallen! projected_gravity_z={gz:.3f} (threshold={-FALL_THRESHOLD:.3f})"
+                    )
 
             # Check 2: unreasonable target position
             if not self._in_damping_mode:
@@ -475,10 +518,14 @@ class HardwareBackend(RobotBackend):
                 else:
                     kp, kd = 20.0, 1.0  # Safe fallback
             else:
-                kp = self._policy_kp[i]
-                kd = self._policy_kd[i]
+                safe_kp, safe_kd = STANDUP_GAINS.get(name, (20.0, 1.0))
+                authority = self._policy_authority
+                kp = safe_kp + authority * (self._policy_kp[i] - safe_kp)
+                kd = safe_kd + authority * (self._policy_kd[i] - safe_kd)
 
             pos = float(targets[i])
+            if is_fixed_head_joint:
+                pos = 0.0
             if name in JOINT_LIMITS and not is_fixed_head_joint:
                 lo, hi = JOINT_LIMITS[name]
                 pos = float(np.clip(pos, lo, hi))
@@ -487,7 +534,7 @@ class HardwareBackend(RobotBackend):
 
             _send_mit_command(
                 self.buses[bus_idx], motor_id,
-                pos_rad=pos, vel_rad_s=0.0,
+                pos_rad=pos * self._joint_directions[i], vel_rad_s=0.0,
                 kp=kp, kd=kd, torque_nm=0.0,
                 params=params,
             )
@@ -531,6 +578,13 @@ class HardwareBackend(RobotBackend):
             _flush_bus(bus)
         self._read_and_filter()
         print("[DEBUG] Hardware buffers flushed.")
+
+    def set_policy_authority(self, authority: float) -> None:
+        """Blend from standing gains to policy gains at a bounded authority."""
+        if not math.isfinite(authority) or not 0.0 <= authority <= 1.0:
+            raise ValueError("Policy authority must be between 0 and 1")
+        self._policy_authority = float(authority)
+        print(f"[POLICY] Authority set to {self._policy_authority:.0%}.")
 
     def get_imu_angular_velocity(self) -> np.ndarray: 
         if self.use_imu:
@@ -579,6 +633,11 @@ class HardwareBackend(RobotBackend):
         return np.zeros(self.num_joints, dtype=np.float32)
 
     def shutdown(self) -> None:
+        if self.imu is not None:
+            try:
+                self.imu.stop()
+            except Exception:
+                pass
         self._shutdown_buses()
 
     def get_actual_frequency(self) -> float: return self._actual_cmd_freq

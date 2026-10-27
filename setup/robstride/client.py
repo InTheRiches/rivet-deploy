@@ -2,6 +2,7 @@ import dataclasses
 import enum
 import math
 import struct
+import time
 from typing import List
 
 import can
@@ -248,7 +249,35 @@ class Client:
     
 
     def zero_pos(self, motor_id: int, motor_model=1) -> FeedbackResp:
-        
-        self.bus.send(self._rs_msg(MotorMsg.ZeroPos, self.host_can_id, motor_id, [0x01, 0, 0, 0, 0, 0, 0, 0]))
-        resp = self._recv()
-        return self._parse_feedback_resp(resp, motor_id, motor_model)
+        return self.zero_pos_many([motor_id], motor_model)[motor_id]
+
+    def zero_pos_many(self, motor_ids: list[int], motor_model=1) -> dict[int, FeedbackResp]:
+        """Issue zero-position commands as one bus batch and collect each ACK."""
+        requested = list(motor_ids)
+        if not requested or len(set(requested)) != len(requested):
+            raise ValueError("motor_ids must be a non-empty list without duplicates")
+
+        for motor_id in requested:
+            self.bus.send(self._rs_msg(
+                MotorMsg.ZeroPos, self.host_can_id, motor_id,
+                [0x01, 0, 0, 0, 0, 0, 0, 0],
+            ))
+
+        pending = set(requested)
+        responses: dict[int, FeedbackResp] = {}
+        deadline = time.monotonic() + self.recv_timeout * len(requested)
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"No zero-position acknowledgement from motor IDs {sorted(pending)}")
+            resp = self.bus.recv(timeout=remaining)
+            if resp is None:
+                raise TimeoutError(f"No zero-position acknowledgement from motor IDs {sorted(pending)}")
+            if resp.is_error_frame:
+                continue
+            msg_type, motor_id, _ = self._parse_resp_abitration_id(resp.arbitration_id)
+            if msg_type != MotorMsg.Feedback.value or motor_id not in pending:
+                continue
+            responses[motor_id] = self._parse_feedback_resp(resp, motor_id, motor_model)
+            pending.remove(motor_id)
+        return responses

@@ -230,7 +230,7 @@
         
         <!-- JOINT: Left_Hip_Yaw -->
         <body name="Left_Hip_Top_Holder" pos="0.04527 -0.018751 -0.0025">
-          <joint name="Left_Hip_Yaw" axis="0 0 1" range="-0.2618 0.2618" armature="0.02"/>
+          <joint name="Left_Hip_Yaw" axis="0 0 1" range="-0.2618 0.2618" armature="0.014985"/>
           <inertial pos="0.00162 0.003199 -0.011367" mass="0.08" fullinertia="0.000247 0.000261 0.000411 -5e-06 2.3e-05 1.1e-05"/>
           <geom class="visual" mesh="Left_Hip_Top_Holder" pos="0.103104 -0.05 -0.021836"/>
           
@@ -244,7 +244,7 @@
 
             <!-- JOINT: Left_Hip_Roll -->
             <body name="Left_Hip_Roll_Connector" pos="0.0025 -0.018751 -0.04527">
-              <joint name="Left_Hip_Roll" axis="-1 0 0" range="-0.2618 0.349" armature="0.02"/>
+              <joint name="Left_Hip_Roll" axis="-1 0 0" range="-0.2618 0.349" armature="0.014985"/>
               <inertial pos="0.002336 0.02932 9e-05" mass="0.1" fullinertia="0.000314 7e-05 0.000291 3.6e-05 1e-06 -1e-06"/>
               <geom class="visual" mesh="Left_Hip_Roll_Connector" pos="0.085104 -0.0625 0.040708"/>
 
@@ -328,7 +328,7 @@
         
         <!-- JOINT: Right_Hip_Yaw -->
         <body name="Right_Hip_Top_Holder" pos="0.04527 0.018751 -0.0025">
-           <joint name="Right_Hip_Yaw" axis="0 0 1" range="-0.2618 0.2618" armature="0.02"/>
+           <joint name="Right_Hip_Yaw" axis="0 0 1" range="-0.2618 0.2618" armature="0.014985"/>
            <inertial pos="0.00162 -0.003199 -0.013107" mass="0.08" fullinertia="0.000247 0.000261 0.000411 5e-06 2.3e-05 -1.1e-05"/>
            <geom class="visual" mesh="Right_Hip_Top_Holder" pos="0.103104 0.05 -0.021836"/>
 
@@ -342,7 +342,7 @@
 
                <!-- JOINT: Right_Hip_Roll -->
                <body name="Right_Hip_Roll_Connector" pos="0.0025 -0.018751 -0.04527">
-                   <joint name="Right_Hip_Roll" axis="-1 0 0" range="-0.349 0.2618" armature="0.02"/>
+                   <joint name="Right_Hip_Roll" axis="-1 0 0" range="-0.349 0.2618" armature="0.014985"/>
                    <inertial pos="0.002336 -0.02932 9e-05" mass="0.1" fullinertia="0.000314 7e-05 0.000291 -3.6e-05 1e-06 1e-06"/>
                    <geom class="visual" mesh="Right_Hip_Roll_Connector" pos="0.085104 0.0625 0.042448"/>
 

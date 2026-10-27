@@ -7,6 +7,9 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Dict  # <--- ADDED Dict
 
+from bdx_api.actuator_specs import ROBSTRIDE_06_GAINS
+from bdx_api.deployment import PROJECT_ROOT, load_deployment_config
+
 
 # ==========================================
 # Model Path Resolution
@@ -16,20 +19,23 @@ def resolve_model_path() -> Path:
     env_path = os.getenv("BDX_MODEL_PATH")
     if env_path:
         p = Path(env_path)
+        if not p.is_absolute():
+            p = Path.cwd() / p
         if not p.exists():
             raise FileNotFoundError(f"BDX_MODEL_PATH={env_path} does not exist")
-        return p
+        return p.resolve()
 
-    project_root = Path(__file__).resolve().parent.parent
-    default_path = project_root / "models" / "pushhard.onnx"
+    _, deployment = load_deployment_config()
+    configured_model = Path(deployment.get("policy_model", "models/walk.onnx"))
+    default_path = configured_model if configured_model.is_absolute() else PROJECT_ROOT / configured_model
 
     if not default_path.exists():
         raise FileNotFoundError(
             f"No model found at {default_path}. "
-            f"Set BDX_MODEL_PATH or place your .onnx file there."
+            "Update policy_model in config/rivet_deployment.yaml or set BDX_MODEL_PATH."
         )
 
-    return default_path
+    return default_path.resolve()
 
 
 MODEL_PATH = resolve_model_path()
@@ -180,13 +186,13 @@ STANDUP_GAINS = {
 # ==========================================
 # Used if the ONNX exporter accidentally writes Kp=1.0 and Kd=0.0
 POLICY_GAINS_FALLBACK = {
-    "Left_Hip_Yaw":    (78.957, 5.027),
-    "Left_Hip_Roll":   (78.957, 5.027),
+    "Left_Hip_Yaw":    ROBSTRIDE_06_GAINS,
+    "Left_Hip_Roll":   ROBSTRIDE_06_GAINS,
     "Left_Hip_Pitch":  (78.957, 5.027),
     "Left_Knee":       (78.957, 5.027),
     "Left_Ankle":      (16.581, 1.056),
-    "Right_Hip_Yaw":   (78.957, 5.027),
-    "Right_Hip_Roll":  (78.957, 5.027),
+    "Right_Hip_Yaw":   ROBSTRIDE_06_GAINS,
+    "Right_Hip_Roll":  ROBSTRIDE_06_GAINS,
     "Right_Hip_Pitch": (78.957, 5.027),
     "Right_Knee":      (78.957, 5.027),
     "Right_Ankle":     (16.581, 1.056),

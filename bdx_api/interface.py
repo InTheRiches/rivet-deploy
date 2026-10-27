@@ -206,8 +206,11 @@ class PyTorchPolicyBackend(BasePolicyBackend):
 # Policy Runner
 # ==========================================
 class PolicyRunner:
+    DEFAULT_HARDWARE_AUTHORITY_LEVELS = [0.0, 0.1, 0.25, 0.5, 0.75, 1.0]
+
     def __init__(self, backend: RobotBackend, model_path: Path, decimation: int = 4,
-                 cfg_override: RobotPolicyConfig = None):
+                 cfg_override: RobotPolicyConfig = None,
+                 authority_levels: list[float] | None = None):
         self.backend = backend
         self.cfg: RobotPolicyConfig = cfg_override if cfg_override is not None else load_policy_config(model_path)
         
@@ -220,6 +223,18 @@ class PolicyRunner:
             raise ValueError("Model must be .onnx or .pt")
 
         self.decimation = decimation
+        if authority_levels is None and hasattr(backend, "set_policy_authority"):
+            authority_levels = self.DEFAULT_HARDWARE_AUTHORITY_LEVELS
+        self.authority_levels = [1.0] if authority_levels is None else [float(v) for v in authority_levels]
+        if not self.authority_levels:
+            raise ValueError("authority_levels cannot be empty")
+        if len(self.authority_levels) > 1 and (self.authority_levels[0] != 0.0
+                or self.authority_levels[-1] != 1.0
+                or any(not 0.0 <= v <= 1.0 for v in self.authority_levels)
+                or any(a >= b for a, b in zip(self.authority_levels, self.authority_levels[1:]))):
+            raise ValueError("authority_levels must increase from 0.0 to 1.0")
+        if len(self.authority_levels) == 1 and self.authority_levels != [1.0]:
+            raise ValueError("A single authority level must be 1.0")
 
         self.joint_map = backend.get_joint_map(self.cfg.joint_names)
         self.num_actuators = len(self.joint_map)
@@ -289,7 +304,13 @@ class PolicyRunner:
         self.backend.standup(duration=2.0)
 
         print("\nRobot is standing with safe gains. Place it on the floor.")
-        print(">>> Press ENTER to deploy the policy (switches to trained Kp/Kd)...")
+        first_authority = self.authority_levels[0]
+        if hasattr(self.backend, "set_policy_authority"):
+            self.backend.set_policy_authority(first_authority)
+        if len(self.authority_levels) > 1:
+            print(f">>> Press ENTER to start the policy at {first_authority:.0%} authority.")
+        else:
+            print(">>> Press ENTER to deploy the policy at full authority...")
 
         enter_pressed = threading.Event()
         def _wait_for_enter():
@@ -309,6 +330,25 @@ class PolicyRunner:
             return
 
         self.backend.activate_policy_gains()
+
+        authority_stage = 0
+        authority_advance = threading.Event()
+
+        def _request_authority_advance():
+            next_authority = self.authority_levels[authority_stage + 1]
+            print(
+                f"\n[POLICY] Holding at {self.authority_levels[authority_stage]:.0%}. "
+                f"Inspect the robot, then press ENTER to advance to {next_authority:.0%}; "
+                "Ctrl+C stops the run."
+            )
+            try:
+                input()
+                authority_advance.set()
+            except (EOFError, OSError):
+                self._interrupted = True
+
+        if len(self.authority_levels) > 1:
+            threading.Thread(target=_request_authority_advance, daemon=True).start()
 
         # --- Audio setup ---
         _audio_proc = None
@@ -347,6 +387,18 @@ class PolicyRunner:
 
         while self.backend.is_running() and not self.kb.should_quit and not self._interrupted:
             loop_start = time.perf_counter()
+
+            if authority_advance.is_set() and authority_stage < len(self.authority_levels) - 1:
+                authority_stage += 1
+                authority_advance.clear()
+                authority = self.authority_levels[authority_stage]
+                if hasattr(self.backend, "set_policy_authority"):
+                    self.backend.set_policy_authority(authority)
+                print(f"[POLICY] Running at {authority:.0%} authority.")
+                if authority_stage < len(self.authority_levels) - 1:
+                    threading.Thread(target=_request_authority_advance, daemon=True).start()
+                else:
+                    print("[POLICY] Full authority reached. Ctrl+C stops the run.")
 
             # --- SOUND HANDLING ---
             sound_req = self.kb.get_sound_request()
@@ -417,6 +469,7 @@ class PolicyRunner:
 
             # Calculate final targets using the smoothed action
             action_delta = self.current_interpolated_actions * self.action_scale
+            action_delta *= self.authority_levels[authority_stage]
             self.dof_targets[self.joint_map] = self.default_pos[self.joint_map] + action_delta
 
             # Apply head/neck offsets — smoothed so motion isn't jerky
@@ -499,8 +552,8 @@ class ImitationPolicyRunner(PolicyRunner):
     POLICY_DT = 0.02  # 50 Hz control rate
 
     def __init__(self, backend: RobotBackend, model_path: Path, decimation: int,
-                 cfg_override, pkl_path: str):
-        super().__init__(backend, model_path, decimation, cfg_override)
+                 cfg_override, pkl_path: str, authority_levels: list[float] | None = None):
+        super().__init__(backend, model_path, decimation, cfg_override, authority_levels)
 
         import torch
         import importlib.util, sys

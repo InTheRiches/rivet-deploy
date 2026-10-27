@@ -30,6 +30,9 @@ real = [
     "adafruit-circuitpython-bno055",
     "scipy",
 ]
+orbbec = [
+    "pyorbbecsdk2>=2.1.2",
+]
 
 [build-system]
 requires = ["hatchling"]
