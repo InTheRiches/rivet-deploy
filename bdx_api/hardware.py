@@ -11,6 +11,7 @@ import serial
 
 from bdx_api.config import load_policy_config, load_isaaclab_config, STANDUP_GAINS, POLICY_GAINS_FALLBACK, RobotPolicyConfig
 from bdx_api.deployment import load_deployment_config
+from bdx_api.can_bus import open_can_bus, validate_can_transport
 from bdx_api.interface import RobotBackend
 from pathlib import Path
 from scipy.spatial.transform import Rotation
@@ -219,16 +220,32 @@ MAX_TARGET_RAD = 1.5
 # ==========================================
 # Hardware Backend
 # ==========================================
+class HardwareInitializationCancelled(Exception):
+    """Raised when the operator declines the pre-enable hardware review."""
+
+
 class HardwareBackend(RobotBackend):
     def __init__(self, model_path: Path, loop_dt: float = 0.005,
                  standup_duration: float = 2.0, imu_port: str = "/dev/ttyUSB0",
                  imu_backend: str = "orbbec",
                  legs_only: bool = False, use_imu: bool = True, cfg_override: RobotPolicyConfig = None,
-                 deployment_config_path: str | Path | None = None):
+                 deployment_config_path: str | Path | None = None,
+                 can_interface: str = "socketcan", slcan_channel: str | None = None,
+                 slcan_bitrate: int = 1_000_000, slcan_tty_baudrate: int = 115_200,
+                 confirm_initial_positions: bool = False):
 
         self.use_imu = use_imu
         self._deployment_path, self._deployment = load_deployment_config(deployment_config_path)
         self._can_channels = list(self._deployment["can_channels"])
+        self._can_interface = can_interface
+        self._slcan_channel = slcan_channel
+        self._slcan_bitrate = slcan_bitrate
+        self._slcan_tty_baudrate = slcan_tty_baudrate
+        validate_can_transport(
+            self._can_channels,
+            can_interface=self._can_interface,
+            slcan_channel=self._slcan_channel,
+        )
 
         self.cfg = cfg_override if cfg_override is not None else load_policy_config(model_path)
 
@@ -291,10 +308,17 @@ class HardwareBackend(RobotBackend):
             self._motor_type_by_id[motor_id] = motor_type
             self._latencies[motor_id] =[]
 
-        print("Initializing CAN buses...")
+        print(f"Initializing CAN buses using {self._can_interface}...")
         self.buses =[]
         for ch in self._can_channels:
-            bus = can.interface.Bus(interface="socketcan", channel=ch)
+            bus = open_can_bus(
+                ch,
+                self._can_channels,
+                can_interface=self._can_interface,
+                slcan_channel=self._slcan_channel,
+                slcan_bitrate=self._slcan_bitrate,
+                slcan_tty_baudrate=self._slcan_tty_baudrate,
+            )
             self.buses.append(bus)
         atexit.register(self._shutdown_buses)
 
@@ -311,7 +335,11 @@ class HardwareBackend(RobotBackend):
         self._filtered_velocities = np.zeros(self.num_joints, dtype=np.float32)
         self._initialized_filter = False
 
-        
+        # Real deploy can review encoder readings before IMU startup, enabling,
+        # or any position/velocity/torque command is sent.
+        if confirm_initial_positions:
+            self._confirm_initial_positions()
+
         print("Initializing IMU...")
         if self.use_imu:
             if imu_backend == "orbbec":
@@ -376,6 +404,88 @@ class HardwareBackend(RobotBackend):
         # Keep the measured pose supported while the operator reviews the ready prompt.
         self._send_targets(self._filtered_positions.copy(), use_standup_gains=True)
         print("\nHardware backend ready.")
+
+    def _confirm_initial_positions(self) -> None:
+        try:
+            from Robstride.client import Client
+        except Exception:
+            self._close_buses_without_motor_commands()
+            raise
+
+        print("\n" + "=" * 72)
+        print("  INITIAL MOTOR ANGLE REVIEW (motors remain disabled)")
+        print("=" * 72)
+        print("Reading each configured joint's reported mechpos. This is a read-only check.")
+
+        clients = {
+            bus_idx: Client(self.buses[bus_idx], retry_count=0, recv_timeout=1.0)
+            for bus_idx in range(len(self.buses))
+        }
+        policy_targets = np.zeros(self.num_joints, dtype=np.float32)
+        policy_targets[:self.num_policy_joints] = self.cfg.default_joint_pos
+        readings = []
+
+        for index, (name, wiring, direction) in enumerate(
+            zip(self.all_joint_names, self._joint_wiring, self._joint_directions)
+        ):
+            bus_idx, motor_id, _motor_type = wiring
+            channel = self._can_channels[bus_idx]
+            try:
+                _flush_bus(self.buses[bus_idx])
+                raw_angle_rad = float(clients[bus_idx].read_param(motor_id, "mechpos"))
+                if not math.isfinite(raw_angle_rad):
+                    raise ValueError(f"non-finite mechpos value: {raw_angle_rad}")
+            except Exception as exc:
+                self._close_buses_without_motor_commands()
+                raise RuntimeError(
+                    f"Could not read {name} on {channel} ID {motor_id} before enabling motors: {exc}. "
+                    "No motor was enabled. Check the CAN connection and configured ID, then retry."
+                ) from exc
+
+            policy_angle_rad = raw_angle_rad * direction
+            target_rad = float(policy_targets[index])
+            readings.append((
+                name, channel, motor_id,
+                math.degrees(raw_angle_rad),
+                math.degrees(policy_angle_rad),
+                math.degrees(target_rad),
+                math.degrees(policy_angle_rad - target_rad),
+            ))
+
+        print("\nJoint                  CAN ID   Reported   Policy-coord   Stand target   Offset")
+        print("                              deg        deg            deg            deg")
+        for name, channel, motor_id, raw_deg, policy_deg, target_deg, offset_deg in readings:
+            print(
+                f"{name:<22} {channel} {motor_id:>3}"
+                f" {raw_deg:>9.2f} {policy_deg:>13.2f} {target_deg:>14.2f} {offset_deg:>10.2f}"
+            )
+
+        print("\nThe policy-coordinate angle applies the configured direction. Offset is the difference")
+        print("from the policy's standing target. Compare these readings with the robot's actual pose;")
+        print("encoder readings alone cannot detect a zero set at the wrong physical pose.")
+        print("\nSecure/support the robot, clear the movement area, and keep the emergency stop ready.")
+        print("Continuing enables the motors and initially holds the measured pose. The next")
+        print("'READY TO STAND' confirmation starts movement toward the listed standing targets.")
+        try:
+            confirmation = input("Type ANGLES OK to continue, or anything else to cancel: ")
+        except (KeyboardInterrupt, EOFError):
+            self._close_buses_without_motor_commands()
+            raise HardwareInitializationCancelled() from None
+
+        if confirmation.strip() != "ANGLES OK":
+            self._close_buses_without_motor_commands()
+            raise HardwareInitializationCancelled()
+
+    def _close_buses_without_motor_commands(self) -> None:
+        """Close CAN handles without sending enable, disable, or motor targets."""
+        if getattr(self, "_buses_closed", False):
+            return
+        self._buses_closed = True
+        for bus in getattr(self, "buses", []):
+            try:
+                bus.shutdown()
+            except Exception:
+                pass
 
     def _shutdown_buses(self):
         if getattr(self, "_buses_closed", False):

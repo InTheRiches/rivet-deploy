@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from pathlib import Path
 from bdx_api.actuator_specs import ROBSTRIDE_06_GAINS
+from bdx_api.can_bus import add_can_transport_arguments, can_transport_kwargs
 
 # Set Matplotlib backend to 'Agg' for headless environments (like Jetson Orin Nano)
 import matplotlib
@@ -43,6 +44,9 @@ def main():
     parser.add_argument("--xml", type=str, default="xml/bdxr_legs.xml", help="Path to MuJoCo XML")
     
     parser.add_argument("--model", type=str, default="models/policy.pt", help="Path to policy model")
+    parser.add_argument("--deployment-config", type=str, default=None,
+                        help="Path to Rivet hardware map (real hardware only)")
+    add_can_transport_arguments(parser)
     parser.add_argument("--legs", action="store_true", help="Only use leg joints")
     parser.add_argument("--no_imu", action="store_true", help="Disable IMU initialization")
     
@@ -74,7 +78,9 @@ def main():
             model_path=Path(args.model),
             loop_dt=args.sim_dt,
             legs_only=args.legs,
-            use_imu=not args.no_imu 
+            use_imu=not args.no_imu,
+            deployment_config_path=args.deployment_config,
+            **can_transport_kwargs(args),
         )
 
     # =================================================================

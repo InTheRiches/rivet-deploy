@@ -5,6 +5,7 @@ import signal
 import atexit
 import threading
 import subprocess
+import shutil
 import numpy as np
 import onnxruntime as ort
 from abc import ABC, abstractmethod
@@ -350,22 +351,61 @@ class PolicyRunner:
         if len(self.authority_levels) > 1:
             threading.Thread(target=_request_authority_advance, daemon=True).start()
 
-        # --- Audio setup ---
+        # --- Optional audio setup ---
         _audio_proc = None
         _all = sorted(Path("assets").glob("*.wav")) if Path("assets").exists() else []
         _test = [f for f in _all if f.name == "test.wav"]
         _others = [f for f in _all if f.name != "test.wav"]
         _wav_files = _others[:8] + _test  # test.wav pinned to key 9
-        vol = int(151 * 65 / 100)  # 65% volume
-        subprocess.run(["amixer", "-c", "2", "cset", "numid=4", f"{vol},{vol}"], capture_output=True)
-        subprocess.run(["amixer", "-c", "2", "sset", "PCM Playback Switch", "on"], capture_output=True)
+        _audio_player = None
+        if sys.platform == "darwin":
+            afplay = shutil.which("afplay")
+            if afplay:
+                _audio_player = [afplay, "-v", "0.65"]
+        else:
+            aplay = shutil.which("aplay")
+            if aplay:
+                _audio_player = [aplay, "-D", "plughw:2,0", "-q"]
+                amixer = shutil.which("amixer")
+                if amixer:
+                    vol = int(151 * 65 / 100)  # 65% volume
+                    try:
+                        subprocess.run(
+                            [amixer, "-c", "2", "cset", "numid=4", f"{vol},{vol}"],
+                            capture_output=True,
+                        )
+                        subprocess.run(
+                            [amixer, "-c", "2", "sset", "PCM Playback Switch", "on"],
+                            capture_output=True,
+                        )
+                    except OSError as exc:
+                        print(f"[Audio] Volume setup skipped: {exc}")
+
+        if _audio_player is None:
+            if _wav_files:
+                print("[Audio] No supported audio player found; sound shortcuts are disabled.")
+            _wav_files = []
+
+        def _play_sound(path: Path):
+            if _audio_player is None:
+                return None
+            try:
+                return subprocess.Popen(
+                    [*_audio_player, str(path)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except OSError as exc:
+                print(f"[Audio] Playback unavailable; disabling sound shortcuts: {exc}")
+                return None
+
         _startup_sound = Path("assets/test.wav")
-        if _startup_sound.exists():
+        if _startup_sound.exists() and _audio_player is not None:
             print(f"[Audio] Playing: {_startup_sound.name}")
-            _audio_proc = subprocess.Popen(
-                ["aplay", "-D", "plughw:2,0", "-q", str(_startup_sound)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
+            _audio_proc = _play_sound(_startup_sound)
+            if _audio_proc is None:
+                _audio_player = None
+                _wav_files = []
 
         print("\n" + "=" * 50)
         print("  DEPLOYING POLICY (LIVE MODE)")
@@ -408,11 +448,11 @@ class PolicyRunner:
                     _audio_proc = None
                 if sound_req > 0:
                     idx = sound_req - 1
-                    if idx < len(_wav_files):
-                        _audio_proc = subprocess.Popen(
-                            ["aplay", "-D", "plughw:2,0", "-q", str(_wav_files[idx])],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                        )
+                    if idx < len(_wav_files) and _audio_player is not None:
+                        _audio_proc = _play_sound(_wav_files[idx])
+                        if _audio_proc is None:
+                            _audio_player = None
+                            _wav_files = []
 
             # --- POLICY UPDATE STEP (e.g. 50Hz) ---
             if it % self.decimation == 0:

@@ -14,9 +14,33 @@ Before moving hardware, check the policy names and each mapping:
 python scripts/commission_rivet.py status
 ```
 
+## macOS testing with SLCAN
+
+SocketCAN remains the default. For a USB serial CAN adapter on macOS, choose SLCAN and provide its serial device path (usually a `/dev/cu.*` path). For example:
+
+```sh
+python scripts/commission_rivet.py verify-ids \
+  --can-interface slcan --slcan-channel /dev/cu.usbmodem1234
+python scripts/deploy.py --backend real --legs \
+  --can-interface slcan --slcan-channel /dev/cu.usbmodem1234
+```
+
+Use the same options with `set-id`, `stand-zero`, `check-directions`, `scripts/deploy_chirp.py`, or `sysid/system_id_deploy.py`. The default CAN bitrate is 1,000,000 bit/s and the adapter serial rate is 115,200 baud; override them with `--slcan-bitrate` or `--slcan-tty-baudrate` if your adapter requires different settings. SLCAN maps one serial adapter to one configured logical CAN channel, so `can_channels` must contain exactly one entry.
+
+## Manually disable configured motors
+
+If deployment does not complete its normal shutdown, stop the deploy process and securely support Rivet before running the disable helper. Disabling removes motor holding torque, so an unsupported robot can fall. The helper sends disable commands to each motor ID in the deployment map, reports acknowledgements, and does not send motion targets.
+
+```sh
+python scripts/disable_all_motors.py --can-interface slcan \
+  --slcan-channel /dev/cu.usbmodem11101
+```
+
+Type `DISABLE` when prompted. A motor without an acknowledgement is reported as unconfirmed and should be checked manually.
+
 ## Commission in order
 
-1. **Verify motor IDs.** The tool reads each motor's `mechpos` through the local RobStride client, asks you to confirm the physical joint, and offers to update a mismatched ID immediately. An ID update is sent with `Client.update_id` and then checked at the new ID. The mapping records the verified ID.
+1. **Verify motor IDs.** The tool scans IDs 1–127 on each configured CAN bus using read-only `mechpos` requests, then guides you through the responding IDs one at a time. For each joint it tries the ID already listed in the deployment map first, then the other untested responders as fallbacks. After you confirm Rivet is supported, it enables only the selected motor, sends no position, velocity, or torque target, and disables it after you identify which physical joint enabled. Enabling can energize or hold a motor, so keep Rivet supported. The tool then saves that motor's current ID and CAN bus to the deployment map. If you answer that it was the wrong joint, it asks which motor actually enabled and records that association so you can debug mismatched assignments. This verification changes the YAML mapping, not the motor's stored ID.
 
    ```sh
    python scripts/commission_rivet.py verify-ids
@@ -46,6 +70,12 @@ python scripts/commission_rivet.py status
 
    ```sh
    python scripts/deploy.py --backend real --legs
+
+   python scripts/deploy.py --backend real --can-interface slcan --slcan-channel /dev/cu.usbmodem11101 --no_imu
+   ```
+
+   ```sh
+   python scripts/disable_all_motors.py --can-interface slcan --slcan-channel /dev/cu.usbmodem11101 
    ```
 
    Use `--authority-levels 0,0.05,0.1,0.2,0.35,0.5,0.75,1` to add smaller stages. Pass `--model` when selecting a policy other than the configured default.

@@ -15,6 +15,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from bdx_api.config import load_policy_config
+from bdx_api.can_bus import add_can_transport_arguments, open_can_bus
 from bdx_api.deployment import load_deployment_config, save_deployment_config
 
 
@@ -50,14 +51,78 @@ def ensure_no_id_conflict(config: dict, joint: str, motor_id: int) -> None:
             raise ValueError(f"Motor ID {motor_id} is already assigned to {other_name}")
 
 
-def open_bus(channel: str):
-    import can
+def ask_which_motor_enabled(joints: dict[str, dict]) -> tuple[str | None, bool]:
+    names = list(joints)
+    print("  Which physical motor enabled?")
+    for index, name in enumerate(names, start=1):
+        print(f"    {index}. {name}")
+    while True:
+        answer = input("  Enter its number or joint name, u if unknown, or q to stop: ").strip()
+        if answer.lower() == "q":
+            return None, True
+        if answer.lower() in {"u", "unknown"}:
+            return None, False
+        if answer.isdigit() and 1 <= int(answer) <= len(names):
+            return names[int(answer) - 1], False
+        if answer in joints:
+            return answer, False
+        print("  Choose a listed number or exact joint name, or enter u/q.")
 
-    return can.interface.Bus(interface="socketcan", channel=channel)
+
+def record_verified_motor(
+    config_path: Path,
+    deployment: dict,
+    joint: str,
+    channel: str,
+    motor_id: int,
+) -> None:
+    """Map a responding motor ID to its observed physical joint without changing the motor ID."""
+    entry = require_entry(deployment, joint)
+    old_channel, old_id = entry["can_interface"], entry["motor_id"]
+    previous_owner = next(
+        (
+            other_name
+            for other_name, other_entry in deployment["joints"].items()
+            if other_name != joint and other_entry["motor_id"] == motor_id
+        ),
+        None,
+    )
+    if previous_owner is not None:
+        displaced = require_entry(deployment, previous_owner)
+        displaced["can_interface"] = old_channel
+        displaced["motor_id"] = old_id
+        displaced["id_verified"] = False
+        displaced["direction_verified"] = False
+        print(
+            f"  ID {motor_id} was provisionally assigned to {previous_owner}; "
+            f"that entry moved to {old_channel} ID {old_id} and needs verification."
+        )
+
+    changed = old_channel != channel or old_id != motor_id
+    entry["can_interface"] = channel
+    entry["motor_id"] = motor_id
+    entry["id_verified"] = True
+    if changed:
+        entry["direction_verified"] = False
+    save_deployment_config(config_path, deployment)
+    print(f"  Saved {joint} as {channel} ID {motor_id}; the motor's own ID was not changed.")
+
+
+def open_bus(channel: str, args, deployment: dict):
+    return open_can_bus(
+        channel,
+        deployment["can_channels"],
+        can_interface=args.can_interface,
+        slcan_channel=args.slcan_channel,
+        slcan_bitrate=args.slcan_bitrate,
+        slcan_tty_baudrate=args.slcan_tty_baudrate,
+    )
 
 
 def make_client(bus, timeout: float = 1.0):
-    from robstride.client import Client
+    # Use the repository's client extensions for batched zeroing and EEPROM saves.
+    # The separately installed lowercase `robstride` package does not expose them.
+    from Robstride.client import Client
 
     return Client(bus, recv_timeout=timeout)
 
@@ -106,57 +171,145 @@ def cmd_verify_ids(args) -> None:
     names = selected_names(cfg, args.joint, deployment)
     buses = {}
     clients = {}
+    responding: list[tuple[str, int]] = []
     try:
-        for name in names:
-            entry = require_entry(deployment, name)
-            channel = entry["can_interface"]
-            if channel not in buses:
-                buses[channel] = open_bus(channel)
-                clients[channel] = make_client(buses[channel])
-
-            default_id = entry["motor_id"]
-            raw_id = input(f"{name} on {channel}; current motor ID [{default_id}] (or q to stop): ").strip()
-            if raw_id.lower() == "q":
-                break
-            current_id = int(raw_id) if raw_id else default_id
-            if not 1 <= current_id <= 127:
-                raise ValueError("Motor ID must be between 1 and 127")
-
-            entry["id_verified"] = False
-            save_deployment_config(config_path, deployment)
-            position = clients[channel].read_param(current_id, "mechpos")
-            print(f"  Motor {current_id} answered; encoder position {float(position):+.4f} rad")
-            expected_id = entry["motor_id"]
-            if current_id != expected_id:
-                ensure_no_id_conflict(deployment, name, expected_id)
+        print(
+            "Scanning configured CAN buses by reading mechpos only. "
+            "This discovery step does not enable or move any motor."
+        )
+        for channel in deployment["can_channels"]:
+            buses[channel] = open_bus(channel, args, deployment)
+            clients[channel] = make_client(buses[channel])
+            scan_client = make_client(buses[channel], timeout=0.1)
+            transport_channel = args.slcan_channel if args.can_interface == "slcan" else channel
+            print(f"  Scanning {channel} ({transport_channel}) motor IDs 1–127...")
+            channel_ids = []
+            for motor_id in range(1, 128):
                 try:
-                    clients[channel].read_param(expected_id, "mechpos")
+                    scan_client.read_param(motor_id, "mechpos")
                 except Exception:
-                    pass
-                else:
-                    raise RuntimeError(
-                        f"Configured target ID {expected_id} also answers on {channel}; "
-                        "resolve the duplicate ID before changing this motor"
-                    )
-                answer = input(
-                    f"  Reassign this motor from ID {current_id} to policy slot ID {expected_id}? "
-                    "Type CHANGE to send the RobStride ID update: "
-                ).strip()
-                if answer != "CHANGE":
-                    print("  Left unchanged; this joint remains unverified.")
-                    entry["id_verified"] = False
-                    save_deployment_config(config_path, deployment)
                     continue
-                clients[channel].update_id(current_id, expected_id)
-                position = clients[channel].read_param(expected_id, "mechpos")
-                print(f"  New ID {expected_id} answered; encoder position {float(position):+.4f} rad")
+                channel_ids.append(motor_id)
+                responding.append((channel, motor_id))
+            ids_text = ", ".join(str(motor_id) for motor_id in channel_ids) or "none"
+            print(f"  {channel}: responding motor IDs: {ids_text}")
 
-            answer = input(
-                f"  Confirm the responding motor is physically installed at {name}? Type YES: "
-            ).strip()
-            entry["id_verified"] = answer == "YES"
+        if not responding:
+            print("No motors responded to the read-only scan; the hardware map was not changed.")
+            return
+
+        ready = input(
+            "The next step can energize/hold one motor at a time, but sends no motion target. "
+            "Keep Rivet supported and the area clear. Type ENABLE CHECK to continue: "
+        ).strip()
+        if ready != "ENABLE CHECK":
+            print("Motor identification cancelled; the hardware map was not changed.")
+            return
+
+        print(
+            "\nNext, each responding ID will be enabled by itself so you can identify its physical joint. "
+            "For each joint, its configured ID is tried first, followed by the other untested responders. "
+            "Only an enable command is sent: no position, velocity, or torque target is issued. "
+            "The motor is disabled as soon as you answer."
+        )
+        remaining_candidates = list(responding)
+        verified_this_run: set[str] = set()
+        stop = False
+
+        for name in names:
+            if name in verified_this_run:
+                print(f"\n{name}: already identified during this session.")
+                continue
+
+            entry = require_entry(deployment, name)
+            entry["id_verified"] = False
+            entry["direction_verified"] = False
             save_deployment_config(config_path, deployment)
-            print("  ID verified and saved." if entry["id_verified"] else "  Not confirmed; left pending.")
+            print(f"\nLooking for physical joint: {name}")
+            found_expected = False
+
+            while remaining_candidates:
+                preferred = (entry["can_interface"], entry["motor_id"])
+                candidate_index = (
+                    remaining_candidates.index(preferred)
+                    if preferred in remaining_candidates
+                    else 0
+                )
+                channel, motor_id = remaining_candidates.pop(candidate_index)
+                ready = input(
+                    f"  Press ENTER to enable {channel} ID {motor_id} while watching {name}; "
+                    "type q to stop: "
+                ).strip().lower()
+                if ready == "q":
+                    stop = True
+                    break
+
+                try:
+                    response = clients[channel].enable(motor_id)
+                except Exception as exc:
+                    print(f"  ID {motor_id} did not acknowledge enable: {exc}")
+                    try:
+                        clients[channel].disable(motor_id)
+                    except Exception as disable_exc:
+                        print(
+                            f"  Could not confirm disable for {channel} ID {motor_id}: "
+                            f"{disable_exc}. Disable it manually before continuing."
+                        )
+                    continue
+
+                try:
+                    print(
+                        f"  {channel} ID {motor_id} acknowledged enable "
+                        f"(mode={response.mode.name}, errors={response.errors or 'none'})."
+                    )
+                    while True:
+                        answer = input(
+                            f"  Is the motor at {name} the one enabled? [y/n/q]: "
+                        ).strip().lower()
+                        if answer in {"y", "n", "q"}:
+                            break
+                        print("  Enter y, n, or q.")
+
+                    if answer == "q":
+                        stop = True
+                    elif answer == "y":
+                        record_verified_motor(config_path, deployment, name, channel, motor_id)
+                        verified_this_run.add(name)
+                        found_expected = True
+                    else:
+                        actual_joint, should_stop = ask_which_motor_enabled(deployment["joints"])
+                        if should_stop:
+                            stop = True
+                        elif actual_joint is None:
+                            print(f"  ID {motor_id} left unidentified; it will not be assigned.")
+                        else:
+                            record_verified_motor(
+                                config_path, deployment, actual_joint, channel, motor_id
+                            )
+                            verified_this_run.add(actual_joint)
+                            found_expected = actual_joint == name
+                finally:
+                    try:
+                        clients[channel].disable(motor_id)
+                        print(f"  Disabled {channel} ID {motor_id}.")
+                    except Exception as exc:
+                        print(
+                            f"  Could not confirm disable for {channel} ID {motor_id}: {exc}. "
+                            "Disable it manually before continuing."
+                        )
+
+                if stop or found_expected:
+                    break
+
+            if stop:
+                break
+            if not found_expected and name not in verified_this_run:
+                print(f"  {name} remains unverified; no responding ID was confirmed for it.")
+
+        print("\nID verification results:")
+        for name, entry in deployment["joints"].items():
+            state = "verified" if entry.get("id_verified", False) else "pending"
+            print(f"  {name:20} {entry['can_interface']} ID {entry['motor_id']:3}: {state}")
     finally:
         for bus in buses.values():
             bus.shutdown()
@@ -169,7 +322,7 @@ def cmd_set_id(args) -> None:
     entry = require_entry(deployment, args.joint)
     ensure_no_id_conflict(deployment, args.joint, args.new_id)
     channel = entry["can_interface"]
-    bus = open_bus(channel)
+    bus = open_bus(channel, args, deployment)
     client = make_client(bus)
     try:
         position = client.read_param(args.current_id, "mechpos")
@@ -240,7 +393,7 @@ def cmd_check_directions(args) -> None:
                 raise RuntimeError(f"Verify the ID for {name} before checking its direction")
             channel = entry["can_interface"]
             if channel not in buses:
-                buses[channel] = open_bus(channel)
+                buses[channel] = open_bus(channel, args, deployment)
             bus = buses[channel]
             client = make_client(bus)
             motor_id = entry["motor_id"]
@@ -344,7 +497,7 @@ def cmd_stand_zero(args) -> None:
             per_channel[entry["can_interface"]].append(entry["motor_id"])
         for channel, motor_ids in per_channel.items():
             if motor_ids:
-                buses[channel] = open_bus(channel)
+                buses[channel] = open_bus(channel, args, deployment)
         errors: list[str] = []
 
         def zero_channel(channel: str, motor_ids: list[int]) -> None:
@@ -439,21 +592,28 @@ def main() -> None:
     parser.add_argument("--model", default=None, help="ONNX model; defaults to policy_model in the hardware map")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("status", help="Show policy joint order and commissioning state").set_defaults(func=cmd_status)
-    ids = commands.add_parser("verify-ids", help="Check every mapped joint and optionally change CAN IDs")
+    ids = commands.add_parser(
+        "verify-ids",
+        help="Discover responding IDs and identify motors one at a time without motion commands",
+    )
+    add_can_transport_arguments(ids)
     ids.add_argument("--joint", help="Verify only this configured joint")
     ids.set_defaults(func=cmd_verify_ids)
     set_id = commands.add_parser("set-id", help="Change one motor ID immediately and update the hardware map")
+    add_can_transport_arguments(set_id)
     set_id.add_argument("joint")
     set_id.add_argument("--current-id", type=int, required=True)
     set_id.add_argument("--new-id", type=int, required=True)
     set_id.set_defaults(func=cmd_set_id)
     directions = commands.add_parser("check-directions", help="Move each policy joint by 1 degree and verify its sign")
+    add_can_transport_arguments(directions)
     directions.add_argument("--joint", help="Check only this policy joint")
     directions.set_defaults(func=cmd_check_directions)
     zero = commands.add_parser(
         "stand-zero",
         help="Zero all configured motors while the robot is manually held in its standing pose",
     )
+    add_can_transport_arguments(zero)
     zero.set_defaults(func=cmd_stand_zero)
 
     args = parser.parse_args()

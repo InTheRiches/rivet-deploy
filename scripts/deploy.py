@@ -1,12 +1,21 @@
 import os
 import csv
 import argparse
+import sys
 import numpy as np
 from pathlib import Path
+
+# Make direct execution work from the checkout, even when the package has not
+# been installed into the active Python environment (or the command is run
+# from a different working directory).
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # --- NEW: Import the config loader to print metadata ---
 from bdx_api.config import load_policy_config, load_isaaclab_config, load_imitation_config
 from bdx_api.deployment import PROJECT_ROOT, load_deployment_config, resolve_deployment_config
+from bdx_api.can_bus import add_can_transport_arguments, can_transport_kwargs
 
 def main():
     parser = argparse.ArgumentParser(description="BDX-R Deploy — sim or real")
@@ -16,6 +25,7 @@ def main():
                         help="Path to ONNX policy model")
     parser.add_argument("--deployment-config", type=str, default=None,
                         help="Path to Rivet hardware map (defaults to config/rivet_deployment.yaml)")
+    add_can_transport_arguments(parser)
     parser.add_argument("--authority-levels", type=str, default="0,0.1,0.25,0.5,0.75,1.0",
                         help="Operator-gated real-policy authority stages from 0 to 1")
     parser.add_argument("--isaaclab", action="store_true",
@@ -150,28 +160,23 @@ def main():
             cfg_override=cfg_override,
         )
     elif args.backend == "real":
+        from bdx_api.hardware import HardwareBackend, HardwareInitializationCancelled
         try:
-            ready = input(
-                "Secure/support the robot, clear the movement area, and keep the emergency stop ready. "
-                "Type READY to initialize real hardware: "
+            backend = HardwareBackend(
+                model_path=model_path,
+                loop_dt=1.0 / args.ctrl_hz,
+                imu_port=args.imu_port,
+                imu_backend=args.imu_backend,
+                legs_only=args.legs,
+                use_imu=not args.no_imu,
+                cfg_override=cfg_override,
+                deployment_config_path=deployment_config_path,
+                confirm_initial_positions=True,
+                **can_transport_kwargs(args),
             )
-        except (KeyboardInterrupt, EOFError):
-            print("Hardware initialization cancelled.")
+        except HardwareInitializationCancelled:
+            print("Deployment cancelled before any motor was enabled.")
             return
-        if ready.strip() != "READY":
-            print("Hardware initialization cancelled.")
-            return
-        from bdx_api.hardware import HardwareBackend
-        backend = HardwareBackend(
-            model_path=model_path,
-            loop_dt=1.0 / args.ctrl_hz,
-            imu_port=args.imu_port,
-            imu_backend=args.imu_backend,
-            legs_only=args.legs,
-            use_imu=not args.no_imu,
-            cfg_override=cfg_override,
-            deployment_config_path=deployment_config_path,
-        )
     else:
         raise ValueError(f"Unknown backend: {args.backend}")
 

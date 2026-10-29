@@ -16,6 +16,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 from bdx_api.config import load_policy_config
+from bdx_api.can_bus import add_can_transport_arguments, can_transport_kwargs
 
 def get_joint_amplitudes(joint_names, global_scale=1.0):
     amps = np.zeros(len(joint_names), dtype=np.float32)
@@ -81,6 +82,7 @@ def main():
     parser.add_argument("--backend", type=str, default="sim", choices=["sim", "real"])
     parser.add_argument("--model", type=str, default="models/newlegs.onnx")
     parser.add_argument("--xml", type=str, default="xml/bdxr_legs.xml")
+    add_can_transport_arguments(parser)
     
     parser.add_argument("--mode", type=str, default="sine", choices=["constant", "sine"])
     parser.add_argument("--amp_scale", type=float, default=1.0, help="Multiplier for sine joint amplitudes")
@@ -111,7 +113,12 @@ def main():
         backend.step = fixed_base_step
     else:
         from bdx_api.hardware import HardwareBackend
-        backend = HardwareBackend(model_path=model_path, loop_dt=args.sim_dt, legs_only=True)
+        backend = HardwareBackend(
+            model_path=model_path,
+            loop_dt=args.sim_dt,
+            legs_only=True,
+            **can_transport_kwargs(args),
+        )
 
     joint_map = backend.get_joint_map(cfg.joint_names)
     num_policy_joints = len(cfg.joint_names)
